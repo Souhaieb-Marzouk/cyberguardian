@@ -28,10 +28,12 @@ Pillow>=9.0.0
 
 # ============================================================
 # Windows-specific dependencies (only needed on Windows)
-# These are installed automatically on Windows systems
+# IMPORTANT: On Windows, you must run the pywin32 post-install
+# script after installing. See setup_windows.bat for automatic setup.
 # ============================================================
 
 # Windows API access (for registry, signatures, etc.)
+# After pip install, run: python Scripts\pywin32_postinstall.py -install
 pywin32>=305; sys_platform == 'win32'
 
 # WMI for Windows Management Instrumentation

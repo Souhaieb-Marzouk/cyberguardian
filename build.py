@@ -118,20 +118,52 @@ def get_pyinstaller_args():
     if assets_dir.exists() and list(assets_dir.iterdir()):
         args.extend(['--add-data', f'{assets_dir};assets'])
     
-    # Add icon if it exists
+    # Add icon if it exists - MUST be .ico format on Windows
     icon_path = Path(ICON_PATH)
-    if icon_path.exists():
-        args.extend(['--icon', str(icon_path)])
+    if icon_path.exists() and sys.platform == 'win32':
+        # Convert PNG to ICO if needed
+        ico_path = icon_path.with_suffix('.ico')
+        if not ico_path.exists() and icon_path.suffix.lower() == '.png':
+            try:
+                from PIL import Image
+                img = Image.open(icon_path)
+                img.save(ico_path, format='ICO', sizes=[(16,16), (32,32), (48,48), (64,64), (128,128), (256,256)])
+                print(f"  Converted icon: {ico_path}")
+            except Exception as e:
+                print(f"  Warning: Could not convert icon: {e}")
+        
+        if ico_path.exists():
+            args.extend(['--icon', str(ico_path)])
     
-    # Platform-specific imports
+    # Platform-specific imports for Windows
     if sys.platform == 'win32':
+        # pywin32 modules - critical for proper bundling
         args.extend([
             '--hidden-import', 'win32security',
             '--hidden-import', 'win32api',
             '--hidden-import', 'win32con',
             '--hidden-import', 'win32process',
+            '--hidden-import', 'win32file',
+            '--hidden-import', 'win32event',
+            '--hidden-import', 'winerror',
+            '--hidden-import', 'pywintypes',
+            '--hidden-import', 'pythoncom',
             '--hidden-import', 'wmi',
         ])
+        
+        # Add pywin32 DLLs directory if available
+        try:
+            import pywintypes
+            import pythoncom
+            import os
+            
+            # Get pywin32 system directory
+            pywin32_system = os.path.dirname(pywintypes.__file__)
+            if os.path.exists(pywin32_system):
+                # Add the pywin32_system32 directory which contains DLLs
+                args.extend(['--add-binary', f'{pywin32_system};pywin32_system32'])
+        except ImportError:
+            pass  # pywin32 may not be installed yet
     
     return args
 
@@ -146,6 +178,11 @@ def check_prerequisites():
         return False
     
     print(f"  ✓ Python {sys.version.split()[0]}")
+    
+    # Warn about very new Python versions
+    if sys.version_info >= (3, 13):
+        print("  ⚠ Warning: Python 3.13+ may have compatibility issues with pywin32")
+        print("    Recommended: Python 3.10-3.12 for best compatibility")
     
     # Check PyInstaller
     try:
@@ -167,6 +204,50 @@ def check_prerequisites():
             print(f"  ✗ {package} not found")
             return False
     
+    # Windows-specific checks
+    if sys.platform == 'win32':
+        try:
+            import pywintypes
+            print(f"  ✓ pywintypes")
+        except ImportError:
+            print("  ✗ pywintypes not found")
+            print("    Installing pywin32...")
+            subprocess.run([sys.executable, '-m', 'pip', 'install', 'pywin32'], check=True)
+            # Try to run post-install script
+            print("    Running pywin32 post-install script...")
+            try:
+                import site
+                site_packages = site.getsitepackages()[0]
+                post_install = f'python "{site_packages}\\..\\Scripts\\pywin32_postinstall.py" -install'
+                os.system(post_install)
+            except Exception as e:
+                print(f"    Warning: Could not run post-install: {e}")
+                print("    Please run manually: python Scripts\\pywin32_postinstall.py -install")
+            
+            # Try importing again
+            try:
+                import pywintypes
+                print(f"  ✓ pywintypes (after install)")
+            except ImportError:
+                print("  ✗ pywintypes still not available - run setup_windows.bat")
+                return False
+        
+        try:
+            import pythoncom
+            print(f"  ✓ pythoncom")
+        except ImportError:
+            print("  ✗ pythoncom not found - pywin32 may not be properly installed")
+            print("    Run: setup_windows.bat")
+            return False
+        
+        try:
+            import win32security
+            print(f"  ✓ win32security")
+        except ImportError:
+            print("  ✗ win32security not found")
+            print("    Run: pip install pywin32")
+            return False
+    
     return True
 
 
@@ -180,22 +261,34 @@ def clean_build():
     for dir_name in dirs_to_remove:
         path = Path(dir_name)
         if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
-            print(f"  Removed: {path}")
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                print(f"  Removed: {path}")
+            except Exception as e:
+                print(f"  Warning: Could not remove {path}: {e}")
     
     # Remove .spec files
     for spec_file in Path('.').glob('*.spec'):
-        spec_file.unlink()
-        print(f"  Removed: {spec_file}")
+        try:
+            spec_file.unlink()
+            print(f"  Removed: {spec_file}")
+        except Exception as e:
+            print(f"  Warning: Could not remove {spec_file}: {e}")
     
     # Remove __pycache__ directories recursively
     for pycache in Path('.').rglob('__pycache__'):
-        shutil.rmtree(pycache, ignore_errors=True)
+        try:
+            shutil.rmtree(pycache, ignore_errors=True)
+        except:
+            pass
     
     # Remove egg-info directories
     for egg_info in Path('.').glob('*.egg-info'):
-        shutil.rmtree(egg_info, ignore_errors=True)
-        print(f"  Removed: {egg_info}")
+        try:
+            shutil.rmtree(egg_info, ignore_errors=True)
+            print(f"  Removed: {egg_info}")
+        except:
+            pass
     
     print("  ✓ Clean complete")
 
@@ -204,8 +297,28 @@ def build_executable():
     """Build the executable using PyInstaller."""
     print(f"\nBuilding {APP_NAME} v{VERSION}...")
     
+    # Check for Python 3.14+ compatibility issues
+    if sys.version_info >= (3, 14):
+        print("\n  ⚠ WARNING: Python 3.14+ detected!")
+        print("  Python 3.14 has known issues with PyInstaller timestamp handling.")
+        print("  If build fails, try using Python 3.11-3.12 instead.\n")
+    
     # Check and create assets first
     check_and_create_assets()
+    
+    # Clean dist directory to avoid timestamp issues
+    dist_dir = Path('dist')
+    if dist_dir.exists():
+        try:
+            # Try to remove any existing exe files specifically
+            for exe_file in dist_dir.glob('*.exe'):
+                try:
+                    exe_file.unlink()
+                    print(f"  Removed existing: {exe_file}")
+                except:
+                    pass
+        except:
+            pass
     
     # Get PyInstaller arguments
     pyinstaller_args = get_pyinstaller_args()
@@ -221,6 +334,15 @@ def build_executable():
     
     if result.returncode != 0:
         print("  ✗ Build failed!")
+        
+        # Provide specific guidance for Python 3.14 timestamp error
+        if sys.version_info >= (3, 14):
+            print("\n  Python 3.14+ compatibility issue detected.")
+            print("  Solutions:")
+            print("    1. Use Python 3.11 or 3.12 (recommended)")
+            print("    2. Try: pip install --upgrade pyinstaller")
+            print("    3. Delete the .spec file and try again")
+        
         return False
     
     executable_path = Path('dist') / f'{APP_NAME}.exe'
