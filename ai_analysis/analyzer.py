@@ -95,8 +95,7 @@ class AIAnalyzer:
     
     # Model names
     MODEL_NAMES = {
-        #AIProvider.DEEPSEEK: "deepseek-reasoner",  # Uses reasoning model for better analysis
-        AIProvider.DEEPSEEK: "deepseek-chat",  # Uses reasoning model for better analysis
+        AIProvider.DEEPSEEK: "deepseek-chat",  # Using chat model for reliable JSON output
         AIProvider.OPENAI: "gpt-4o",
         AIProvider.GEMINI: "gemini-pro",
     }
@@ -282,7 +281,7 @@ class AIAnalyzer:
         self._executor.submit(_analyze)
     
     def _build_analysis_prompt(self, detection_data: Dict[str, Any]) -> str:
-        """Build analysis prompt from detection data."""
+        """Build analysis prompt from detection data including VirusTotal results."""
         detection_type = detection_data.get('detection_type', 'unknown')
         risk_level = detection_data.get('risk_level', 'unknown')
         indicator = detection_data.get('indicator', '')
@@ -293,6 +292,82 @@ class AIAnalyzer:
         file_path = detection_data.get('file_path', '')
         command_line = detection_data.get('command_line', '')
         user = detection_data.get('user', '')
+        
+        # Build VirusTotal section if available
+        vt_section = ""
+        virustotal_result = detection_data.get('virustotal_result')
+        if virustotal_result:
+            # Build detailed VT information
+            malicious_ip_details = []
+            for ip_r in virustotal_result.get('ip_results', []):
+                if ip_r.get('is_malicious'):
+                    malicious_ip_details.append(
+                        f"IP {ip_r.get('ip_address')}: {ip_r.get('detection_ratio')} ({ip_r.get('malicious_count')}/{ip_r.get('total_engines')} engines), "
+                        f"Country: {ip_r.get('country', 'Unknown')}, AS: {ip_r.get('as_owner', 'Unknown')}, "
+                        f"Threats: {', '.join(ip_r.get('threat_names', [])[:3])}"
+                    )
+            
+            malicious_hash_details = []
+            for h_r in virustotal_result.get('hash_results', []):
+                if h_r.get('is_malicious'):
+                    malicious_hash_details.append(
+                        f"Hash {h_r.get('hash_value')}...: {h_r.get('detection_ratio')} "
+                        f"({h_r.get('malicious_count')}/{h_r.get('total_engines')} engines), "
+                        f"Type: {h_r.get('file_type', 'Unknown')}, "
+                        f"Threats: {', '.join(h_r.get('threat_names', [])[:3])}"
+                    )
+            
+            malicious_domain_details = []
+            for d_r in virustotal_result.get('domain_results', []):
+                if d_r.get('is_malicious'):
+                    malicious_domain_details.append(
+                        f"Domain {d_r.get('domain')}: {d_r.get('detection_ratio')}, "
+                        f"Categories: {', '.join(d_r.get('categories', [])[:3])}"
+                    )
+            
+            vt_section = f"""
+=== CRITICAL: VIRUSTOTAL INTELLIGENCE RESULTS ===
+The following Indicators of Compromise (IOCs) were checked against VirusTotal:
+
+SUMMARY:
+- Total IOCs Checked: {virustotal_result.get('iocs_checked', 0)}
+- MALICIOUS IOCs Found: {virustotal_result.get('iocs_malicious', 0)}
+- Clean IOCs: {virustotal_result.get('iocs_clean', 0)}
+- Highest Risk Level from VT: {virustotal_result.get('highest_risk_level', 'unknown').upper()}
+- Risk Adjustment Factor: {virustotal_result.get('overall_risk_adjustment', 0):.2f}
+
+VT Summary: {virustotal_result.get('vt_summary', 'No summary available')}
+
+ALL IOCs FOUND IN EVIDENCE:
+{json.dumps(virustotal_result.get('all_iocs', {}), indent=2)}
+
+MALICIOUS IP ADDRESSES:
+{json.dumps(malicious_ip_details if malicious_ip_details else ['None found'], indent=2)}
+
+MALICIOUS FILE HASHES:
+{json.dumps(malicious_hash_details if malicious_hash_details else ['None found'], indent=2)}
+
+MALICIOUS DOMAINS:
+{json.dumps(malicious_domain_details if malicious_domain_details else ['None found'], indent=2)}
+
+*** CRITICAL INSTRUCTION ***
+You MUST consider these VirusTotal results in your analysis. 
+- If VirusTotal shows {virustotal_result.get('iocs_malicious', 0)} malicious IOCs,  this significantly increases the confidence that the detection is a TRUE POSITIVE.
+- Factor in the detection ratios and threat names from antivirus engines when making your assessment.
+- Pay special attention to IPs/domains flagged as malicious - these are CONFIRMED threats.
+- The risk level should be adjusted accordingly based on VT findings.
+"""
+        
+        # Risk adjustment note if VT modified the risk level
+        risk_adjusted_note = ""
+        if detection_data.get('risk_adjusted_by_vt'):
+            original_risk = detection_data.get('original_risk_level', risk_level)
+            risk_adjusted_note = f"""
+*** RISK LEVEL ADJUSTED ***
+The original detection risk level was: {original_risk.upper()}
+Based on VirusTotal findings, the risk level has been adjusted to: {risk_level.upper()}
+This adjustment reflects the confirmed malicious nature of IOCs found in this detection.
+"""
         
         prompt = f"""You are a senior cybersecurity threat analyst with expertise in malware analysis, incident response, and threat intelligence. Perform a comprehensive deep analysis of the following security detection.
 
@@ -306,10 +381,10 @@ class AIAnalyzer:
 - File Path: {file_path}
 - Command Line: {command_line}
 - User: {user}
-
+{risk_adjusted_note}
 === EVIDENCE ===
 {json.dumps(evidence, indent=2)}
-
+{vt_section}
 === ANALYSIS INSTRUCTIONS ===
 Perform a thorough analysis considering:
 
@@ -329,12 +404,18 @@ Perform a thorough analysis considering:
    - Is there evidence of persistence, lateral movement, data exfiltration?
    - Does it match known attack patterns or campaigns?
 
-4. RISK ASSESSMENT
+4. VIRUSTOTAL INTEGRATION
+   - If VirusTotal results show malicious IOCs, incorporate this evidence strongly
+   - Correlate VT threat names with known malware families
+   - Use VT results to strengthen your confidence assessment
+   - Adjust verdict and risk_score based on VT findings
+
+5. RISK ASSESSMENT
    - Potential impact if executed (data theft, ransomware, backdoor)
    - Likelihood of false positive
    - Urgency level for remediation
 
-5. REMEDIATION GUIDANCE
+6. REMEDIATION GUIDANCE
    - Specific steps to neutralize the threat
    - Containment recommendations
    - Verification steps to confirm removal
@@ -343,14 +424,14 @@ Provide your analysis in the following JSON format:
 {{
     "verdict": "legitimate|suspicious|malicious|needs_investigation",
     "confidence": 0.0-1.0,
-    "summary": "One paragraph executive summary of the threat",
-    "detailed_analysis": "Comprehensive technical analysis with sections for Threat Classification, Technical Analysis, Behavioral Indicators, and Risk Assessment. Be specific and detailed.",
+    "summary": "One paragraph executive summary of the threat including VirusTotal findings if applicable",
+    "detailed_analysis": "Comprehensive technical analysis with sections for Threat Classification, Technical Analysis, Behavioral Indicators, VirusTotal Correlation (if applicable), and Risk Assessment. Be specific and detailed.",
     "recommendations": ["Priority-ordered list of specific actionable remediation steps"],
-    "indicators": ["List of specific IOCs, suspicious behaviors, or malicious characteristics found"],
+    "indicators": ["List of specific IOCs, suspicious behaviors, or malicious characteristics found - include VT-confirmed IOCs"],
     "risk_score": 0-100,
     "threat_type": "malware|apt|ransomware|trojan|backdoor|pua|false_positive|unknown",
     "mitre_techniques": ["Relevant MITRE ATT&CK technique IDs if applicable"],
-    "severity_justification": "Explanation for the assigned risk score and verdict"
+    "severity_justification": "Explanation for the assigned risk score and verdict, including VirusTotal contribution if applicable"
 }}
 
 Respond ONLY with valid JSON. Be thorough and specific in your analysis."""
@@ -359,20 +440,43 @@ Respond ONLY with valid JSON. Be thorough and specific in your analysis."""
     
     def _parse_ai_response(self, response_text: str, provider: AIProvider,
                           detection_data: Dict[str, Any]) -> AnalysisResult:
-        """Parse AI response into AnalysisResult."""
+        """Parse AI response into AnalysisResult with robust error handling."""
         try:
             # Clean response - remove markdown code blocks if present
             cleaned = response_text.strip()
+            
+            # Remove various markdown code block formats
             if cleaned.startswith('```json'):
                 cleaned = cleaned[7:]
-            if cleaned.startswith('```'):
+            elif cleaned.startswith('```'):
                 cleaned = cleaned[3:]
             if cleaned.endswith('```'):
                 cleaned = cleaned[:-3]
             cleaned = cleaned.strip()
             
+            # Try to find JSON object in the response
+            # Look for the first { and last }
+            json_start = cleaned.find('{')
+            json_end = cleaned.rfind('}')
+            
+            if json_start != -1 and json_end != -1 and json_end > json_start:
+                json_str = cleaned[json_start:json_end + 1]
+            else:
+                json_str = cleaned
+            
             # Parse JSON
-            data = json.loads(cleaned)
+            try:
+                data = json.loads(json_str)
+            except json.JSONDecodeError:
+                # Try to fix common JSON issues
+                # Replace single quotes with double quotes (but not inside strings)
+                import re
+                # Fix unquoted keys
+                json_str = re.sub(r'(\w+)(?=\s*:)', r'"\1"', json_str)
+                # Fix single quotes
+                json_str = json_str.replace("'", '"')
+                # Try parsing again
+                data = json.loads(json_str)
             
             # Map verdict string to enum
             verdict_map = {
@@ -381,38 +485,101 @@ Respond ONLY with valid JSON. Be thorough and specific in your analysis."""
                 'malicious': Verdict.MALICIOUS,
                 'needs_investigation': Verdict.NEEDS_INVESTIGATION,
             }
-            verdict_str = data.get('verdict', 'unknown').lower()
+            verdict_str = data.get('verdict', 'unknown').lower().replace(' ', '_').replace('-', '_')
             verdict = verdict_map.get(verdict_str, Verdict.UNKNOWN)
+            
+            # Ensure all required fields have safe defaults
+            def safe_float(val, default=0.5):
+                try:
+                    return float(val)
+                except (TypeError, ValueError):
+                    return default
+            
+            def safe_int(val, default=50):
+                try:
+                    return int(float(val))
+                except (TypeError, ValueError):
+                    return default
+            
+            def safe_list(val):
+                if isinstance(val, list):
+                    return [str(x) for x in val if x is not None]
+                elif isinstance(val, str):
+                    return [val] if val else []
+                return []
+            
+            def safe_str(val, default=''):
+                if val is None:
+                    return default
+                return str(val)
             
             return AnalysisResult(
                 provider=provider,
                 verdict=verdict,
-                confidence=float(data.get('confidence', 0.5)),
-                summary=data.get('summary', ''),
-                detailed_analysis=data.get('detailed_analysis', ''),
-                recommendations=data.get('recommendations', []),
-                indicators=data.get('indicators', []),
-                risk_score=int(data.get('risk_score', 50)),
-                threat_type=data.get('threat_type', 'unknown'),
-                mitre_techniques=data.get('mitre_techniques', []),
-                severity_justification=data.get('severity_justification', ''),
-                raw_response={'parsed': data, 'raw': response_text}
+                confidence=safe_float(data.get('confidence'), 0.5),
+                summary=safe_str(data.get('summary'), 'Analysis completed'),
+                detailed_analysis=safe_str(data.get('detailed_analysis'), 'See raw response for details.'),
+                recommendations=safe_list(data.get('recommendations')),
+                indicators=safe_list(data.get('indicators')),
+                risk_score=safe_int(data.get('risk_score'), 50),
+                threat_type=safe_str(data.get('threat_type'), 'unknown'),
+                mitre_techniques=safe_list(data.get('mitre_techniques')),
+                severity_justification=safe_str(data.get('severity_justification'), ''),
+                raw_response={'parsed': data, 'raw': response_text[:2000]}
             )
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse AI response: {e}")
-            return AnalysisResult(
-                provider=provider,
-                verdict=Verdict.UNKNOWN,
-                confidence=0.0,
-                summary="Failed to parse AI response",
-                detailed_analysis=response_text[:500],
-                recommendations=["Manual review required"],
-                indicators=[],
-                risk_score=50,
-                threat_type="unknown",
-                severity_justification="Unable to parse AI response - manual analysis required",
-                error=f"JSON parse error: {str(e)}"
-            )
+            logger.error(f"Failed to parse AI response as JSON: {e}")
+            logger.debug(f"Response text (first 500 chars): {response_text[:500]}")
+            # Try to extract useful information from non-JSON response
+            return self._parse_text_fallback(response_text, provider, str(e))
+        except Exception as e:
+            logger.error(f"Unexpected error parsing AI response: {e}")
+            return self._parse_text_fallback(response_text, provider, str(e))
+    
+    def _parse_text_fallback(self, response_text: str, provider: AIProvider, 
+                            error_msg: str) -> AnalysisResult:
+        """
+        Fallback parser for non-JSON AI responses.
+        Attempts to extract useful information from plain text responses.
+        """
+        text_lower = response_text.lower()
+        
+        # Try to detect verdict from text
+        verdict = Verdict.NEEDS_INVESTIGATION
+        confidence = 0.3
+        
+        if 'malicious' in text_lower or 'malware' in text_lower:
+            verdict = Verdict.MALICIOUS
+            confidence = 0.6
+        elif 'suspicious' in text_lower:
+            verdict = Verdict.SUSPICIOUS
+            confidence = 0.5
+        elif 'legitimate' in text_lower or 'safe' in text_lower or 'benign' in text_lower:
+            verdict = Verdict.LEGITIMATE
+            confidence = 0.5
+        
+        # Extract risk score if mentioned
+        import re
+        risk_score = 50
+        risk_match = re.search(r'risk[_\s]*score[:\s]*(\d+)', text_lower)
+        if risk_match:
+            risk_score = min(100, max(0, int(risk_match.group(1))))
+        
+        return AnalysisResult(
+            provider=provider,
+            verdict=verdict,
+            confidence=confidence,
+            summary="AI analysis completed (text format - JSON parsing failed)",
+            detailed_analysis=response_text[:1500] if response_text else "No response content available.",
+            recommendations=["Manual review recommended", "Verify AI response format"],
+            indicators=[],
+            risk_score=risk_score,
+            threat_type="unknown",
+            mitre_techniques=[],
+            severity_justification=f"Response was not in expected JSON format. Error: {error_msg}",
+            raw_response={'raw': response_text[:2000], 'parse_error': error_msg},
+            error=f"JSON parse error: {error_msg}"
+        )
     
     def _call_deepseek(self, prompt: str, detection_data: Dict[str, Any]) -> AnalysisResult:
         """Call Deepseek API."""

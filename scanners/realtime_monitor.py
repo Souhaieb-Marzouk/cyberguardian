@@ -3,6 +3,8 @@ CyberGuardian Real-Time Monitoring Module
 =========================================
 Provides real-time monitoring for processes, files, registry,
 and network activity.
+
+Enhanced with memory analysis for suspicious processes.
 """
 
 import os
@@ -24,6 +26,14 @@ from scanners.network_scanner import NetworkScanner
 from utils.config import get_config
 from utils.logging_utils import get_logger, log_detection
 from utils.whitelist import get_whitelist
+
+# Import memory analyzer for real-time deep analysis
+try:
+    from scanners.memory_analyzer import MemoryAnalyzer, is_memory_analysis_available
+    MEMORY_ANALYSIS_AVAILABLE = is_memory_analysis_available()
+except ImportError:
+    MEMORY_ANALYSIS_AVAILABLE = False
+    logging.warning("Memory analyzer not available - real-time memory analysis disabled")
 
 logger = get_logger('monitoring.realtime')
 
@@ -47,7 +57,18 @@ class RealTimeMonitor:
     - File system changes
     - Registry modifications
     - Network connections
+    
+    Enhanced Features:
+    - Memory analysis for suspicious processes
+    - Memory analysis for suspicious network connections
+    - IOC extraction from running processes
     """
+    
+    # Processes that trigger automatic memory analysis
+    HIGH_RISK_PROCESSES = {
+        'powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe',
+        'mshta.exe', 'regsvr32.exe', 'rundll32.exe', 'certutil.exe',
+    }
     
     def __init__(self):
         self.config = get_config()
@@ -58,6 +79,11 @@ class RealTimeMonitor:
         self.file_scanner = FileScanner()
         self.registry_scanner = RegistryScanner()
         self.network_scanner = NetworkScanner()
+        
+        # Memory analyzer for deep analysis
+        self._memory_analyzer = None
+        self._memory_analysis_lock = threading.Lock()
+        self._analyzed_pids: Set[int] = set()  # Track analyzed PIDs to avoid duplicates
         
         # Monitoring state
         self._running = False
@@ -77,6 +103,21 @@ class RealTimeMonitor:
         
         # Registry baseline
         self._registry_baseline: Dict[str, str] = {}
+    
+    def _get_memory_analyzer(self) -> Optional[Any]:
+        """Get or create memory analyzer instance (thread-safe)."""
+        if not MEMORY_ANALYSIS_AVAILABLE:
+            return None
+        
+        with self._memory_analysis_lock:
+            if self._memory_analyzer is None:
+                try:
+                    self._memory_analyzer = MemoryAnalyzer()
+                    logger.info("Memory analyzer initialized for real-time monitoring")
+                except Exception as e:
+                    logger.warning(f"Could not initialize memory analyzer: {e}")
+                    return None
+            return self._memory_analyzer
     
     def set_detection_callback(self, callback: Callable[[Detection], None]) -> None:
         """Set callback for detections."""
@@ -292,6 +333,13 @@ class RealTimeMonitor:
                             # Report detections
                             for detection in detections:
                                 self._report_detection(detection)
+                            
+                            # Memory analysis for high-risk processes or processes with detections
+                            if (proc_info.name.lower() in self.HIGH_RISK_PROCESSES or detections):
+                                memory_detections = self._analyze_process_memory_realtime(proc_info)
+                                for detection in memory_detections:
+                                    self._report_detection(detection)
+                                    event.detections.append(detection)
                     
                     except Exception as e:
                         logger.debug(f"Error analyzing new process {pid}: {e}")
@@ -305,6 +353,101 @@ class RealTimeMonitor:
             stop_event.wait(poll_interval)
         
         logger.info("Process monitor stopped")
+    
+    def _analyze_process_memory_realtime(self, proc_info) -> List[Detection]:
+        """
+        Perform quick memory analysis on a suspicious process in real-time.
+        
+        Args:
+            proc_info: ProcessInfo object for the process
+        
+        Returns:
+            List of detections from memory analysis
+        """
+        detections = []
+        
+        # Skip if already analyzed
+        if proc_info.pid in self._analyzed_pids:
+            return detections
+        
+        self._analyzed_pids.add(proc_info.pid)
+        
+        memory_analyzer = self._get_memory_analyzer()
+        if not memory_analyzer:
+            return detections
+        
+        try:
+            logger.info(f"Performing memory analysis on {proc_info.name} (PID: {proc_info.pid})")
+            
+            # Perform quick memory scan
+            quick_result = memory_analyzer.quick_memory_scan(proc_info.pid)
+            
+            if quick_result.get('is_suspicious'):
+                # Perform full memory analysis for suspicious processes
+                memory_result = memory_analyzer.analyze_process(proc_info.pid)
+                
+                # Check for code injection
+                for injection in memory_result.injected_code:
+                    risk_level = RiskLevel.HIGH if injection.confidence >= 0.7 else RiskLevel.MEDIUM
+                    
+                    detection = Detection(
+                        detection_id=self._generate_detection_id(),
+                        detection_type=f'realtime_memory_{injection.injection_type.lower()}',
+                        indicator=f"{proc_info.name} (PID: {proc_info.pid})",
+                        indicator_type='process',
+                        risk_level=risk_level,
+                        confidence=injection.confidence,
+                        description=f"Code injection detected in {proc_info.name}: {injection.injection_type}",
+                        detection_reason=f"{injection.injection_type} at 0x{injection.memory_address:X}",
+                        remediation=[
+                            f"Terminate process (PID: {proc_info.pid})",
+                            "Investigate for malware",
+                            "Check process origin"
+                        ],
+                        process_name=proc_info.name,
+                        process_id=proc_info.pid,
+                        file_path=proc_info.path,
+                        evidence={
+                            'injection_type': injection.injection_type,
+                            'memory_address': f'0x{injection.memory_address:X}',
+                            'region_size': injection.region_size,
+                            **injection.evidence
+                        }
+                    )
+                    detections.append(detection)
+                
+                # Check for IOCs in memory
+                for ioc in memory_result.iocs:
+                    if ioc.confidence >= 0.8:
+                        detection = Detection(
+                            detection_id=self._generate_detection_id(),
+                            detection_type=f'realtime_memory_ioc_{ioc.ioc_type.lower()}',
+                            indicator=ioc.value,
+                            indicator_type='network' if ioc.ioc_type in ['URL', 'IP', 'DOMAIN'] else 'string',
+                            risk_level=RiskLevel.HIGH if ioc.confidence >= 0.9 else RiskLevel.MEDIUM,
+                            confidence=ioc.confidence,
+                            description=f"Suspicious IOC in {proc_info.name} memory: {ioc.value[:50]}",
+                            detection_reason=f"Extracted from memory at 0x{ioc.memory_address:X}",
+                            remediation=[
+                                f"Investigate {ioc.ioc_type}: {ioc.value}",
+                                f"Analyze process (PID: {proc_info.pid})",
+                                "Check for data exfiltration"
+                            ],
+                            process_name=proc_info.name,
+                            process_id=proc_info.pid,
+                            file_path=proc_info.path,
+                            evidence={
+                                'ioc_type': ioc.ioc_type,
+                                'ioc_value': ioc.value,
+                                'memory_address': f'0x{ioc.memory_address:X}',
+                            }
+                        )
+                        detections.append(detection)
+        
+        except Exception as e:
+            logger.debug(f"Memory analysis error for {proc_info.name} (PID {proc_info.pid}): {e}")
+        
+        return detections
     
     def _file_monitor_loop(self, stop_event: threading.Event) -> None:
         """Monitor file system changes."""
@@ -621,6 +764,13 @@ class RealTimeMonitor:
                         
                         for detection in detections:
                             self._report_detection(detection)
+                        
+                        # Memory analysis for suspicious network connections
+                        if detections or remote_port in self.network_scanner.SUSPICIOUS_PORTS:
+                            memory_detections = self._analyze_network_process_memory(pid, conn_info)
+                            for detection in memory_detections:
+                                self._report_detection(detection)
+                                event.detections.append(detection)
                 
                 # Check for beaconing periodically
                 beacon_detections = self.network_scanner.detect_beaconing()
@@ -635,6 +785,104 @@ class RealTimeMonitor:
             stop_event.wait(poll_interval)
         
         logger.info("Network monitor stopped")
+    
+    def _analyze_network_process_memory(self, pid: int, conn_info: Any) -> List[Detection]:
+        """
+        Perform memory analysis on a process with suspicious network connections.
+        
+        Args:
+            pid: Process ID
+            conn_info: ConnectionInfo object
+        
+        Returns:
+            List of detections from memory analysis
+        """
+        detections = []
+        
+        # Skip if already analyzed
+        if pid in self._analyzed_pids:
+            return detections
+        
+        self._analyzed_pids.add(pid)
+        
+        memory_analyzer = self._get_memory_analyzer()
+        if not memory_analyzer:
+            return detections
+        
+        process_name = conn_info.process_name if hasattr(conn_info, 'process_name') else f"PID-{pid}"
+        
+        try:
+            logger.info(f"Performing memory analysis on network process {process_name} (PID: {pid})")
+            
+            # Perform quick memory scan
+            quick_result = memory_analyzer.quick_memory_scan(pid)
+            
+            if quick_result.get('is_suspicious'):
+                # Perform full memory analysis
+                memory_result = memory_analyzer.analyze_network_process(pid, process_name)
+                
+                # Check for code injection in network processes
+                for injection in memory_result.injected_code:
+                    risk_level = RiskLevel.HIGH if injection.confidence >= 0.7 else RiskLevel.MEDIUM
+                    
+                    detection = Detection(
+                        detection_id=self._generate_detection_id(),
+                        detection_type=f'realtime_network_memory_{injection.injection_type.lower()}',
+                        indicator=f"{process_name} -> {conn_info.remote_ip}:{conn_info.remote_port}",
+                        indicator_type='network',
+                        risk_level=risk_level,
+                        confidence=injection.confidence,
+                        description=f"Code injection in network process {process_name}: {injection.injection_type}",
+                        detection_reason=f"Injected code at 0x{injection.memory_address:X} in process communicating with {conn_info.remote_ip}",
+                        remediation=[
+                            f"Terminate process (PID: {pid})",
+                            f"Block connection to {conn_info.remote_ip}",
+                            "Investigate for malware or RAT",
+                            "Perform full system scan"
+                        ],
+                        process_name=process_name,
+                        process_id=pid,
+                        evidence={
+                            'injection_type': injection.injection_type,
+                            'memory_address': f'0x{injection.memory_address:X}',
+                            'remote_ip': conn_info.remote_ip,
+                            'remote_port': conn_info.remote_port,
+                            **injection.evidence
+                        }
+                    )
+                    detections.append(detection)
+                
+                # Check for network IOCs in memory
+                for ioc in memory_result.iocs:
+                    if ioc.ioc_type in ['URL', 'IP', 'DOMAIN'] and ioc.confidence >= 0.8:
+                        detection = Detection(
+                            detection_id=self._generate_detection_id(),
+                            detection_type=f'realtime_network_memory_ioc_{ioc.ioc_type.lower()}',
+                            indicator=ioc.value,
+                            indicator_type='network',
+                            risk_level=RiskLevel.HIGH if ioc.confidence >= 0.9 else RiskLevel.MEDIUM,
+                            confidence=ioc.confidence,
+                            description=f"Network IOC in {process_name} memory: {ioc.value[:50]}",
+                            detection_reason=f"Extracted from memory at 0x{ioc.memory_address:X}",
+                            remediation=[
+                                f"Investigate {ioc.ioc_type}: {ioc.value}",
+                                f"Analyze network process (PID: {pid})",
+                                "Check for data exfiltration"
+                            ],
+                            process_name=process_name,
+                            process_id=pid,
+                            evidence={
+                                'ioc_type': ioc.ioc_type,
+                                'ioc_value': ioc.value,
+                                'memory_address': f'0x{ioc.memory_address:X}',
+                            }
+                        )
+                        detections.append(detection)
+        
+        except Exception as e:
+            logger.debug(f"Memory analysis error for {process_name} (PID {pid}): {e}")
+        
+        return detections
     
     def _event_processor_loop(self, stop_event: threading.Event) -> None:
         """Process events from queue."""
@@ -663,6 +911,11 @@ class RealTimeMonitor:
                 self._event_callback(event)
             except Exception as e:
                 logger.error(f"Event callback error: {e}")
+    
+    def _generate_detection_id(self) -> str:
+        """Generate a unique detection ID."""
+        import uuid
+        return f"RTD-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8].upper()}"
     
     def _report_detection(self, detection: Detection) -> None:
         """Report a detection."""

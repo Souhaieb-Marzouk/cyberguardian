@@ -3,12 +3,15 @@ CyberGuardian File Scanner Module
 =================================
 Scans files and folders for malicious indicators
 using Yara, entropy analysis, PE analysis, and steganography detection.
+
+Enhanced with Deep Analysis Mode for memory forensics of running files.
 """
 
 import os
 import math
 import logging
 import time
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set, Tuple
 from datetime import datetime
@@ -25,6 +28,14 @@ from utils.whitelist import get_whitelist
 from utils.config import get_config
 from utils.logging_utils import get_logger, log_scan_start, log_scan_complete, log_detection
 from threat_intel.intel import get_threat_intel
+
+# Import memory analyzer for deep analysis
+try:
+    from scanners.memory_analyzer import MemoryAnalyzer, is_memory_analysis_available
+    MEMORY_ANALYSIS_AVAILABLE = is_memory_analysis_available()
+except ImportError:
+    MEMORY_ANALYSIS_AVAILABLE = False
+    logging.warning("Memory analyzer not available - file deep analysis will be limited")
 
 logger = get_logger('scanners.file_scanner')
 
@@ -355,65 +366,503 @@ class OfficeAnalyzer:
 
 
 class SteganographyDetector:
-    """Detect steganography in images and media files."""
+    """
+    Advanced steganography detection in images and media files.
+    
+    Detection Methods:
+    - Multi-layer LSB analysis (1-bit, 2-bit, 4-bit planes)
+    - EOF appended data detection
+    - Known steganography tool signatures
+    - Hidden data extraction and analysis
+    - Malicious content detection in extracted data
+    """
     
     IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp'}
+    
+    # Known steganography tool signatures/magic bytes
+    STEGO_SIGNATURES = {
+        b'STEG': 'OpenStego',
+        b'stego': 'Generic Stego Tool',
+        b'\\\\x89PNG\\\\r\\\\n\\\\x1a\\\\n': 'PNG with hidden data',
+        b'PK\\x03\\x04': 'ZIP archive appended (possible hidden content)',
+        b'Rar!': 'RAR archive appended',
+        b'\\x1f\\x8b': 'GZIP data appended',
+        b'BZh': 'BZIP2 data appended',
+        b'\\x50\\x4b\\x03\\x04': 'ZIP embedded in image',
+    }
+    
+    # EOF markers for different image formats
+    EOF_MARKERS = {
+        '.jpg': [b'\\xff\\xd9'],  # JPEG EOI marker
+        '.jpeg': [b'\\xff\\xd9'],
+        '.png': [b'IEND\\xae\\x42\\x60\\x82'],  # PNG IEND chunk
+        '.gif': [b'\\x00\\x3b'],  # GIF trailer
+        '.bmp': [],  # BMP has size in header
+    }
+    
+    # Suspicious strings to detect in extracted data
+    MALICIOUS_PATTERNS = [
+        # URLs and network indicators
+        (rb'https?://[^\s<>"{}|\\^`\[\]]+', 'URL'),
+        (rb'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', 'IP Address'),
+        (rb'[a-zA-Z0-9-]+\.(com|net|org|io|tk|ml|ga|cf|onion)', 'Domain'),
+        
+        # Executable indicators
+        (rb'MZ\\x90\\x00', 'PE Executable header'),
+        (rb'\\x7fELF', 'ELF Executable header'),
+        (rb'\\xca\\xfe\\xba\\xbe', 'Mach-O Executable'),
+        (rb'PK\\x03\\x04', 'ZIP/Archive (could contain malware)'),
+        
+        # Script indicators
+        (rb'<script', 'JavaScript code'),
+        (rb'#!/bin/', 'Shell script'),
+        (rb'#!/usr/bin/python', 'Python script'),
+        (rb'powershell', 'PowerShell reference'),
+        (rb'cmd\.exe', 'CMD reference'),
+        (rb'wscript', 'Windows Script Host'),
+        
+        # Malware-related strings
+        (rb'mimikatz', 'Mimikatz reference'),
+        (rb'meterpreter', 'Meterpreter reference'),
+        (rb'cobalt\s*strike', 'Cobalt Strike'),
+        (rb'reverse\s*shell', 'Reverse shell'),
+        (rb'backdoor', 'Backdoor reference'),
+        (rb'keylog', 'Keylogger reference'),
+        (rb'password', 'Password reference'),
+        (rb'credential', 'Credential reference'),
+        
+        # Base64 patterns (long strings that could be encoded data)
+        (rb'[A-Za-z0-9+/=]{40,}', 'Possible Base64 encoded data'),
+        
+        # Crypto addresses
+        (rb'[13][a-km-zA-HJ-NP-Z1-9]{25,34}', 'Bitcoin address'),
+        (rb'0x[a-fA-F0-9]{40}', 'Ethereum address'),
+    ]
+    
+    # Suspicious file signatures that might be hidden
+    HIDDEN_FILE_SIGNATURES = {
+        b'MZ': 'Windows Executable (.exe)',
+        b'PK': 'ZIP Archive',
+        b'Rar!': 'RAR Archive',
+        b'\\x7fELF': 'Linux Executable',
+        b'%PDF': 'PDF Document',
+        b'\\xd0\\xcf\\x11\\xe0': 'MS Office Document',
+    }
     
     @staticmethod
     def is_image_file(filepath: Path) -> bool:
         """Check if file is an image."""
         return filepath.suffix.lower() in SteganographyDetector.IMAGE_EXTENSIONS
     
-    @staticmethod
-    def analyze(filepath: Path) -> Dict[str, Any]:
-        """Analyze image for steganography indicators."""
+    @classmethod
+    def analyze(cls, filepath: Path, max_extract_size: int = 1024 * 1024) -> Dict[str, Any]:
+        """
+        Perform comprehensive steganography analysis on an image.
+        
+        Args:
+            filepath: Path to the image file
+            max_extract_size: Maximum bytes to extract for analysis
+            
+        Returns:
+            Dictionary with analysis results including:
+            - has_steganography: bool
+            - confidence: float (0.0-1.0)
+            - threat_level: str ('clean', 'suspicious', 'malicious')
+            - detection_methods: list of methods that detected steganography
+            - extracted_data: analysis of any extracted hidden content
+            - lsb_analysis: detailed LSB analysis results
+            - eof_analysis: appended data analysis
+            - warnings: list of warning messages
+        """
         result = {
             'is_image': True,
             'has_steganography': False,
+            'confidence': 0.0,
+            'threat_level': 'clean',
+            'detection_methods': [],
             'lsb_analysis': {},
+            'eof_analysis': {},
+            'extracted_data': {},
             'entropy_analysis': {},
             'warnings': [],
+            'indicators': [],
         }
         
         try:
-            # Calculate entropy
-            entropy = EntropyCalculator.calculate_file(filepath)
-            result['entropy_analysis']['overall'] = round(entropy, 2)
-            
-            # High entropy in images could indicate hidden data
-            if entropy > 7.5:
-                result['entropy_analysis']['high_entropy'] = True
-                result['warnings'].append(f"High entropy ({entropy:.2f}) - possible hidden data")
-            
-            # Simple LSB analysis
+            # Read image data
             with open(filepath, 'rb') as f:
-                data = f.read(1024)  # Sample first KB
+                image_data = f.read()
+            
+            file_size = len(image_data)
+            
+            # Run all detection methods
+            lsb_result = cls._analyze_lsb(image_data)
+            if lsb_result['detected']:
+                result['has_steganography'] = True
+                result['detection_methods'].append('lsb_analysis')
+                result['lsb_analysis'] = lsb_result
+            
+            eof_result = cls._analyze_eof_appended(filepath, image_data)
+            if eof_result['detected']:
+                result['has_steganography'] = True
+                result['detection_methods'].append('eof_appended')
+                result['eof_analysis'] = eof_result
+            
+            # Entropy analysis
+            entropy = EntropyCalculator.calculate(image_data[:min(len(image_data), 65536)])
+            result['entropy_analysis'] = {
+                'overall': round(entropy, 2),
+                'high_entropy': entropy > 7.8
+            }
+            
+            if entropy > 7.8:
+                result['warnings'].append(f"High entropy ({entropy:.2f}) - possible encrypted/hidden data")
+            
+            # If steganography detected, try to extract and analyze hidden data
+            if result['has_steganography']:
+                extracted = cls._extract_and_analyze(filepath, image_data, lsb_result, eof_result)
+                result['extracted_data'] = extracted
                 
-                # Check for LSB patterns (simplified)
-                lsb_zero_count = 0
-                lsb_one_count = 0
+                # Determine threat level based on extracted content
+                if extracted.get('is_malicious'):
+                    result['threat_level'] = 'malicious'
+                    result['confidence'] = 0.9
+                elif extracted.get('is_suspicious'):
+                    result['threat_level'] = 'suspicious'
+                    result['confidence'] = 0.7
+                else:
+                    result['threat_level'] = 'suspicious'
+                    result['confidence'] = 0.5
                 
-                for byte in data:
-                    if byte & 0x01:
-                        lsb_one_count += 1
-                    else:
-                        lsb_zero_count += 1
+                # Collect indicators
+                result['indicators'] = extracted.get('indicators', [])
                 
-                # Balanced LSB could indicate hidden data
-                ratio = lsb_one_count / (lsb_zero_count + 1)
-                result['lsb_analysis'] = {
-                    'zeros': lsb_zero_count,
-                    'ones': lsb_one_count,
-                    'ratio': round(ratio, 2),
-                    'balanced': 0.9 < ratio < 1.1
-                }
-                
-                if 0.9 < ratio < 1.1:
-                    result['warnings'].append("Balanced LSB pattern - possible steganography")
-                    result['has_steganography'] = True
-        
         except Exception as e:
             result['warnings'].append(f"Steganography analysis error: {str(e)}")
+        
+        return result
+    
+    @classmethod
+    def _analyze_lsb(cls, data: bytes) -> Dict[str, Any]:
+        """
+        Perform multi-layer LSB analysis on image data.
+        
+        Analyzes 1-bit, 2-bit, and 4-bit LSB planes for hidden data patterns.
+        """
+        result = {
+            'detected': False,
+            'confidence': 0.0,
+            'plane_1': {},
+            'plane_2': {},
+            'plane_4': {},
+            'patterns_found': [],
+        }
+        
+        if len(data) < 1024:
+            return result
+        
+        sample_size = min(len(data), 65536)  # Analyze up to 64KB
+        sample = data[:sample_size]
+        
+        # 1-bit LSB analysis (least significant bit)
+        lsb_bits = []
+        for byte in sample:
+            lsb_bits.append(byte & 0x01)
+        
+        ones_count = sum(lsb_bits)
+        zeros_count = len(lsb_bits) - ones_count
+        
+        # Chi-square test for randomness
+        expected = len(lsb_bits) / 2
+        chi_square = ((ones_count - expected) ** 2 + (zeros_count - expected) ** 2) / expected
+        
+        # Balanced LSB indicates possible hidden data
+        ratio = ones_count / (zeros_count + 1)
+        is_balanced = 0.45 < ratio < 1.55
+        
+        result['plane_1'] = {
+            'ones': ones_count,
+            'zeros': zeros_count,
+            'ratio': round(ratio, 3),
+            'chi_square': round(chi_square, 3),
+            'is_balanced': is_balanced,
+            'randomness': round(1 - min(chi_square / 100, 1), 3)  # Higher = more random
+        }
+        
+        if is_balanced and chi_square < 10:
+            result['patterns_found'].append('Balanced 1-bit LSB pattern')
+            result['confidence'] += 0.3
+        
+        # 2-bit LSB analysis (2 least significant bits)
+        lsb2_values = []
+        for byte in sample:
+            lsb2_values.append(byte & 0x03)
+        
+        # Check distribution of 2-bit values (should be uniform if hidden data)
+        value_counts = [0] * 4
+        for v in lsb2_values:
+            value_counts[v] += 1
+        
+        expected_2bit = len(lsb2_values) / 4
+        chi_square_2bit = sum((c - expected_2bit) ** 2 for c in value_counts) / expected_2bit
+        
+        result['plane_2'] = {
+            'distribution': value_counts,
+            'chi_square': round(chi_square_2bit, 3),
+            'is_uniform': chi_square_2bit < 20
+        }
+        
+        if chi_square_2bit < 20:
+            result['patterns_found'].append('Uniform 2-bit LSB pattern')
+            result['confidence'] += 0.2
+        
+        # Check for sequential patterns in LSB (could indicate structured data)
+        sequential_runs = cls._count_sequential_runs(lsb_bits)
+        result['plane_1']['sequential_runs'] = sequential_runs
+        
+        # High number of alternating bits suggests encoded data
+        if sequential_runs.get('alternating', 0) > len(lsb_bits) * 0.3:
+            result['patterns_found'].append('High alternating bit pattern')
+            result['confidence'] += 0.2
+        
+        # Detect if there's readable content in LSB
+        lsb_extracted = cls._extract_lsb_bytes(sample, bits=1)
+        readable_ratio = cls._check_readable_content(lsb_extracted)
+        
+        result['plane_1']['readable_ratio'] = round(readable_ratio, 3)
+        
+        if readable_ratio > 0.1:  # More than 10% readable ASCII
+            result['patterns_found'].append(f'Readable content in LSB ({readable_ratio:.1%})')
+            result['confidence'] += 0.3
+        
+        result['detected'] = result['confidence'] >= 0.4 or len(result['patterns_found']) >= 2
+        
+        return result
+    
+    @staticmethod
+    def _count_sequential_runs(bits: List[int]) -> Dict[str, int]:
+        """Count different types of sequential patterns in bit sequence."""
+        runs = {
+            'zeros': 0,
+            'ones': 0,
+            'alternating': 0,
+        }
+        
+        if len(bits) < 2:
+            return runs
+        
+        current_run = 1
+        last_bit = bits[0]
+        is_alternating = True
+        
+        for i in range(1, len(bits)):
+            if bits[i] == last_bit:
+                current_run += 1
+                is_alternating = False
+            else:
+                if current_run >= 4:
+                    if last_bit == 0:
+                        runs['zeros'] += 1
+                    else:
+                        runs['ones'] += 1
+                current_run = 1
+                last_bit = bits[i]
+            
+            # Check alternating pattern
+            if i >= 2 and bits[i] != bits[i-1] and bits[i-1] != bits[i-2]:
+                runs['alternating'] += 1
+        
+        return runs
+    
+    @staticmethod
+    def _extract_lsb_bytes(data: bytes, bits: int = 1) -> bytes:
+        """Extract bytes from LSB plane."""
+        result = bytearray()
+        
+        if bits == 1:
+            # Extract 1 bit from each byte to form new bytes
+            for i in range(0, len(data) - 7, 8):
+                byte_val = 0
+                for j in range(8):
+                    byte_val |= ((data[i + j] & 0x01) << (7 - j))
+                result.append(byte_val)
+        
+        elif bits == 2:
+            # Extract 2 bits from each byte
+            for i in range(0, len(data) - 3, 4):
+                byte_val = 0
+                for j in range(4):
+                    byte_val |= ((data[i + j] & 0x03) << (6 - j * 2))
+                result.append(byte_val)
+        
+        return bytes(result)
+    
+    @staticmethod
+    def _check_readable_content(data: bytes) -> float:
+        """Check ratio of readable ASCII/printable characters."""
+        if not data:
+            return 0.0
+        
+        readable_count = 0
+        for byte in data:
+            # Printable ASCII range (32-126) plus common whitespace
+            if 32 <= byte <= 126 or byte in (9, 10, 13):
+                readable_count += 1
+        
+        return readable_count / len(data)
+    
+    @classmethod
+    def _analyze_eof_appended(cls, filepath: Path, data: bytes) -> Dict[str, Any]:
+        """
+        Check for data appended after the end of image marker.
+        
+        This is a common steganography technique where data is simply
+        appended after the legitimate image data ends.
+        """
+        result = {
+            'detected': False,
+            'appended_size': 0,
+            'appended_data_preview': '',
+            'file_type': '',
+        }
+        
+        ext = filepath.suffix.lower()
+        eof_markers = cls.EOF_MARKERS.get(ext, [])
+        
+        if not eof_markers:
+            return result
+        
+        # Find the last occurrence of EOF marker
+        last_eof_pos = -1
+        for marker in eof_markers:
+            pos = data.rfind(marker)
+            if pos > last_eof_pos:
+                last_eof_pos = pos + len(marker)
+        
+        if last_eof_pos > 0 and last_eof_pos < len(data):
+            # Data exists after EOF marker
+            appended = data[last_eof_pos:]
+            
+            if len(appended) > 4:  # Minimum threshold
+                result['detected'] = True
+                result['appended_size'] = len(appended)
+                
+                # Preview of appended data (hex and readable)
+                preview_len = min(len(appended), 256)
+                result['appended_data_preview'] = appended[:preview_len].hex()
+                
+                # Check for known file signatures in appended data
+                for sig, file_type in cls.HIDDEN_FILE_SIGNATURES.items():
+                    if appended.startswith(sig):
+                        result['file_type'] = file_type
+                        break
+                
+                # Check for embedded archives
+                for sig, name in [(b'PK\\x03\\x04', 'ZIP'), (b'Rar!', 'RAR'), (b'\\x1f\\x8b', 'GZIP')]:
+                    if sig in appended[:1024]:
+                        result['file_type'] = f'{name} archive'
+                        break
+        
+        return result
+    
+    @classmethod
+    def _extract_and_analyze(cls, filepath: Path, image_data: bytes,
+                             lsb_result: Dict, eof_result: Dict) -> Dict[str, Any]:
+        """
+        Extract hidden data and analyze it for malicious content.
+        
+        Returns analysis of extracted content including:
+        - is_malicious: bool
+        - is_suspicious: bool
+        - content_type: str
+        - indicators: list of detected indicators
+        - extracted_preview: preview of extracted data
+        """
+        result = {
+            'is_malicious': False,
+            'is_suspicious': False,
+            'content_type': 'unknown',
+            'indicators': [],
+            'extracted_preview': '',
+            'extracted_size': 0,
+        }
+        
+        extracted_data = bytearray()
+        
+        # Try to extract from LSB
+        if lsb_result.get('detected'):
+            lsb_extracted = cls._extract_lsb_bytes(image_data[:min(len(image_data), 100000)], bits=1)
+            extracted_data.extend(lsb_extracted[:10240])  # Limit extraction size
+        
+        # Add EOF appended data
+        if eof_result.get('detected') and eof_result.get('appended_size', 0) > 0:
+            ext = filepath.suffix.lower()
+            eof_markers = cls.EOF_MARKERS.get(ext, [])
+            
+            last_eof_pos = -1
+            for marker in eof_markers:
+                pos = image_data.rfind(marker)
+                if pos > last_eof_pos:
+                    last_eof_pos = pos + len(marker)
+            
+            if last_eof_pos > 0:
+                appended = image_data[last_eof_pos:]
+                extracted_data.extend(appended[:10240])
+        
+        if not extracted_data:
+            return result
+        
+        result['extracted_size'] = len(extracted_data)
+        result['extracted_preview'] = extracted_data[:512].hex()
+        
+        # Convert to string for pattern matching
+        try:
+            extracted_str = extracted_data.decode('latin-1')  # Safe decoding
+        except:
+            extracted_str = str(extracted_data)
+        
+        # Check for malicious patterns
+        import re
+        for pattern, indicator_name in cls.MALICIOUS_PATTERNS:
+            try:
+                matches = re.findall(pattern, extracted_data + extracted_str.encode('latin-1', errors='ignore'))
+                if matches:
+                    result['indicators'].append({
+                        'type': indicator_name,
+                        'count': len(matches),
+                        'sample': str(matches[:3])[:100]  # First 3 matches, truncated
+                    })
+                    
+                    # Determine threat level
+                    if indicator_name in ['PE Executable header', 'ELF Executable header', 
+                                          'Mach-O Executable', 'Mimikatz reference',
+                                          'Meterpreter reference', 'Cobalt Strike']:
+                        result['is_malicious'] = True
+                    elif indicator_name in ['URL', 'IP Address', 'Possible Base64 encoded data',
+                                           'PowerShell reference', 'Reverse shell', 'Backdoor reference']:
+                        result['is_suspicious'] = True
+            except Exception:
+                continue
+        
+        # Check for file signatures
+        for sig, file_type in cls.HIDDEN_FILE_SIGNATURES.items():
+            if bytes(extracted_data).startswith(sig):
+                result['indicators'].append({
+                    'type': 'Embedded File',
+                    'file_type': file_type,
+                    'count': 1
+                })
+                result['is_suspicious'] = True
+                result['content_type'] = file_type
+                break
+        
+        # Determine overall content type
+        if not result['indicators']:
+            readable_ratio = cls._check_readable_content(bytes(extracted_data))
+            if readable_ratio > 0.3:
+                result['content_type'] = 'text'
+            else:
+                result['content_type'] = 'binary'
         
         return result
 
@@ -429,6 +878,11 @@ class FileScanner(BaseScanner):
     - Office document analysis
     - Steganography detection
     - Hash lookup
+    
+    Deep Analysis Mode:
+    - Memory analysis of running executables
+    - IOC extraction from process memory
+    - Injection detection in running files
     """
     
     # Maximum file size to scan (100 MB)
@@ -440,12 +894,17 @@ class FileScanner(BaseScanner):
     # Archive extensions
     ARCHIVE_EXTENSIONS = {'.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.cab'}
     
+    # Executable extensions for memory analysis
+    EXECUTABLE_EXTENSIONS = {'.exe', '.dll', '.sys', '.com', '.scr'}
+    
     def __init__(self):
         super().__init__()
         self.config = get_config()
         self.whitelist = get_whitelist()
         self.yara_manager = get_yara_manager()
         self.threat_intel = get_threat_intel()
+        self._deep_analysis = False
+        self._memory_analyzer = None
     
     @property
     def scanner_name(self) -> str:
@@ -455,12 +914,13 @@ class FileScanner(BaseScanner):
     def scanner_type(self) -> str:
         return "file"
     
-    def scan(self, target: Optional[str] = None) -> ScanResult:
+    def scan(self, target: Optional[str] = None, deep_analysis: bool = False) -> ScanResult:
         """
         Scan files or directories.
         
         Args:
             target: File path or directory path to scan
+            deep_analysis: Enable memory analysis for running executables
         
         Returns:
             ScanResult with file analysis findings
@@ -468,6 +928,17 @@ class FileScanner(BaseScanner):
         target_path = Path(target) if target else Path.cwd()
         
         log_scan_start('file', str(target_path))
+        
+        self._deep_analysis = deep_analysis
+        
+        # Initialize memory analyzer for deep analysis
+        if deep_analysis and MEMORY_ANALYSIS_AVAILABLE:
+            try:
+                self._memory_analyzer = MemoryAnalyzer()
+                self.logger.info("Memory analyzer initialized for file deep analysis")
+            except Exception as e:
+                self.logger.warning(f"Could not initialize memory analyzer: {e}")
+                self._memory_analyzer = None
         
         result = ScanResult(
             scan_type='file',
@@ -483,7 +954,7 @@ class FileScanner(BaseScanner):
             files = self._collect_files(target_path)
             result.total_items = len(files)
             
-            self.logger.info(f"Scanning {len(files)} files")
+            self.logger.info(f"Scanning {len(files)} files (deep_analysis={deep_analysis})")
             
             # Scan each file
             for i, filepath in enumerate(files):
@@ -517,6 +988,19 @@ class FileScanner(BaseScanner):
                         description=detection.description
                     )
                 
+                # Deep analysis: Memory analysis for running executables
+                if deep_analysis and self._memory_analyzer and filepath.suffix.lower() in self.EXECUTABLE_EXTENSIONS:
+                    memory_detections = self._analyze_running_file_memory(filepath, detections)
+                    for detection in memory_detections:
+                        result.add_detection(detection)
+                        self._report_detection(detection)
+                        log_detection(
+                            detection_type=detection.detection_type,
+                            indicator=detection.indicator,
+                            risk_level=detection.risk_level.value,
+                            description=detection.description
+                        )
+                
                 if not detections:
                     result.clean_items += 1
             
@@ -527,12 +1011,181 @@ class FileScanner(BaseScanner):
             result.status = ScanStatus.FAILED
             result.error_message = str(e)
         
+        finally:
+            # Cleanup memory analyzer
+            if self._memory_analyzer:
+                try:
+                    self._memory_analyzer.secure_cleanup()
+                except:
+                    pass
+        
         result.end_time = datetime.utcnow()
         result.scan_duration_seconds = (result.end_time - result.start_time).total_seconds()
         
         log_scan_complete('file', result.scan_target, len(result.detections))
         
         return result
+    
+    def _find_processes_for_file(self, filepath: Path) -> List[Dict[str, Any]]:
+        """Find all processes running from a specific file."""
+        processes = []
+        
+        try:
+            import psutil
+            
+            file_path_str = str(filepath.resolve()).lower()
+            
+            for proc in psutil.process_iter(['pid', 'name', 'exe']):
+                try:
+                    proc_exe = proc.info.get('exe', '')
+                    if proc_exe and proc_exe.lower() == file_path_str:
+                        processes.append({
+                            'pid': proc.info['pid'],
+                            'name': proc.info['name'],
+                            'exe': proc_exe
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        
+        except ImportError:
+            self.logger.debug("psutil not available for process enumeration")
+        
+        return processes
+    
+    def _analyze_running_file_memory(self, filepath: Path, existing_detections: List[Detection]) -> List[Detection]:
+        """
+        Analyze memory of processes running this file.
+        
+        Args:
+            filepath: Path to the executable file
+            existing_detections: Detections from static analysis
+        
+        Returns:
+            List of additional detections from memory analysis
+        """
+        detections = []
+        
+        if not self._memory_analyzer:
+            return detections
+        
+        # Find processes running this file
+        running_processes = self._find_processes_for_file(filepath)
+        
+        if not running_processes:
+            return detections
+        
+        self.logger.info(f"Found {len(running_processes)} running processes for {filepath.name}")
+        
+        for proc_info in running_processes[:3]:  # Limit to 3 processes
+            if self.is_cancelled():
+                break
+            
+            pid = proc_info['pid']
+            process_name = proc_info['name']
+            
+            try:
+                # Perform memory analysis
+                memory_result = self._memory_analyzer.analyze_process(pid)
+                
+                # Check for code injection
+                for injection in memory_result.injected_code:
+                    risk_level = RiskLevel.HIGH if injection.confidence >= 0.7 else RiskLevel.MEDIUM
+                    
+                    detection = Detection(
+                        detection_id=self._generate_detection_id(),
+                        detection_type=f'file_memory_{injection.injection_type.lower()}',
+                        indicator=f"{filepath.name} (PID: {pid})",
+                        indicator_type='file',
+                        risk_level=risk_level,
+                        confidence=injection.confidence,
+                        description=f"Code injection in running file {filepath.name}: {injection.injection_type}",
+                        detection_reason=f"{injection.injection_type} detected at 0x{injection.memory_address:X} in process {pid}",
+                        remediation=[
+                            f"Terminate process (PID: {pid})",
+                            f"Quarantine file: {filepath}",
+                            "Scan system for additional malware",
+                            "Investigate process origin"
+                        ],
+                        file_path=str(filepath),
+                        process_name=process_name,
+                        process_id=pid,
+                        evidence={
+                            'injection_type': injection.injection_type,
+                            'memory_address': f'0x{injection.memory_address:X}',
+                            'region_size': injection.region_size,
+                            'protection': injection.protection,
+                            'pid': pid,
+                            'confidence': injection.confidence,
+                            **injection.evidence
+                        }
+                    )
+                    detections.append(detection)
+                
+                # Check for suspicious IOCs in memory
+                for ioc in memory_result.iocs:
+                    if ioc.confidence >= 0.7:
+                        detection = Detection(
+                            detection_id=self._generate_detection_id(),
+                            detection_type=f'file_memory_ioc_{ioc.ioc_type.lower()}',
+                            indicator=ioc.value,
+                            indicator_type='network' if ioc.ioc_type in ['URL', 'IP', 'DOMAIN'] else 'string',
+                            risk_level=RiskLevel.MEDIUM if ioc.confidence >= 0.8 else RiskLevel.LOW,
+                            confidence=ioc.confidence,
+                            description=f"IOC found in {filepath.name} memory: {ioc.value[:50]}",
+                            detection_reason=f"Extracted from process memory at 0x{ioc.memory_address:X}",
+                            remediation=[
+                                f"Investigate {ioc.ioc_type}: {ioc.value}",
+                                f"Analyze running process (PID: {pid})",
+                                "Check for data exfiltration"
+                            ],
+                            file_path=str(filepath),
+                            process_name=process_name,
+                            process_id=pid,
+                            evidence={
+                                'ioc_type': ioc.ioc_type,
+                                'ioc_value': ioc.value,
+                                'memory_address': f'0x{ioc.memory_address:X}',
+                                'context': ioc.context[:200] if ioc.context else '',
+                                'pid': pid
+                            }
+                        )
+                        detections.append(detection)
+                
+                # Check for suspicious memory regions
+                if memory_result.suspicious_regions:
+                    for region in memory_result.suspicious_regions[:3]:
+                        detection = Detection(
+                            detection_id=self._generate_detection_id(),
+                            detection_type='file_memory_suspicious_region',
+                            indicator=f"{filepath.name}:0x{region.base_address:X}",
+                            indicator_type='file',
+                            risk_level=RiskLevel.MEDIUM,
+                            confidence=0.6,
+                            description=f"Suspicious memory region in {filepath.name}: {', '.join(region.suspicion_reasons)}",
+                            detection_reason=f"Memory region at 0x{region.base_address:X} shows suspicious characteristics",
+                            remediation=[
+                                f"Investigate process (PID: {pid})",
+                                "Check for code injection",
+                                f"Analyze memory at 0x{region.base_address:X}"
+                            ],
+                            file_path=str(filepath),
+                            process_name=process_name,
+                            process_id=pid,
+                            evidence={
+                                'base_address': f'0x{region.base_address:X}',
+                                'region_size': region.region_size,
+                                'protection': region.protection,
+                                'memory_type': region.memory_type,
+                                'reasons': region.suspicion_reasons,
+                                'pid': pid
+                            }
+                        )
+                        detections.append(detection)
+            
+            except Exception as e:
+                self.logger.debug(f"Memory analysis error for {filepath.name} PID {pid}: {e}")
+        
+        return detections
     
     def _collect_files(self, target: Path) -> List[Path]:
         """Collect all files to scan from target path."""
@@ -904,7 +1557,7 @@ class FileScanner(BaseScanner):
         return detections
     
     def _check_steganography(self, file_info: FileInfo) -> List[Detection]:
-        """Check images for steganography."""
+        """Check images for steganography with enhanced threat analysis."""
         detections = []
         
         if not file_info.is_image:
@@ -913,26 +1566,104 @@ class FileScanner(BaseScanner):
         stego_result = SteganographyDetector.analyze(file_info.path)
         
         if stego_result.get('has_steganography'):
+            # Determine risk level based on threat analysis
+            threat_level = stego_result.get('threat_level', 'suspicious')
+            confidence = stego_result.get('confidence', 0.5)
+            extracted_data = stego_result.get('extracted_data', {})
+            indicators = stego_result.get('indicators', [])
+            
+            # Map threat level to risk level
+            if threat_level == 'malicious' or extracted_data.get('is_malicious'):
+                risk_level = RiskLevel.HIGH
+                confidence = max(confidence, 0.85)
+                detection_type = 'steganography_malicious'
+                base_description = "Malicious content detected in steganography"
+            elif threat_level == 'suspicious' or extracted_data.get('is_suspicious'):
+                risk_level = RiskLevel.MEDIUM
+                confidence = max(confidence, 0.7)
+                detection_type = 'steganography_suspicious'
+                base_description = "Suspicious content detected in steganography"
+            else:
+                risk_level = RiskLevel.LOW
+                confidence = max(confidence, 0.5)
+                detection_type = 'steganography'
+                base_description = "Possible steganography detected"
+            
+            # Build detailed description with indicators
+            description_parts = [base_description]
+            detection_reasons = []
+            
+            # Add detection method info
+            detection_methods = stego_result.get('detection_methods', [])
+            if 'lsb_analysis' in detection_methods:
+                lsb_info = stego_result.get('lsb_analysis', {})
+                patterns = lsb_info.get('patterns_found', [])
+                if patterns:
+                    detection_reasons.append(f"LSB patterns: {', '.join(patterns[:3])}")
+            if 'eof_appended' in detection_methods:
+                eof_info = stego_result.get('eof_analysis', {})
+                appended_size = eof_info.get('appended_size', 0)
+                file_type = eof_info.get('file_type', 'unknown')
+                detection_reasons.append(f"Data appended after EOF ({appended_size} bytes, type: {file_type})")
+            
+            # Add indicator info
+            if indicators:
+                indicator_types = [i.get('type', 'unknown') for i in indicators[:5]]
+                description_parts.append(f"Indicators: {', '.join(indicator_types)}")
+            
+            description = '. '.join(description_parts)
+            detection_reason = '; '.join(detection_reasons) if detection_reasons else "Steganography patterns detected"
+            
+            # Build evidence dictionary
+            evidence = {
+                'threat_level': threat_level,
+                'detection_methods': detection_methods,
+                'lsb_analysis': stego_result.get('lsb_analysis', {}),
+                'eof_analysis': stego_result.get('eof_analysis', {}),
+                'entropy_analysis': stego_result.get('entropy_analysis', {}),
+                'extracted_size': extracted_data.get('extracted_size', 0),
+                'content_type': extracted_data.get('content_type', 'unknown'),
+                'indicators': indicators,
+                'warnings': stego_result.get('warnings', [])
+            }
+            
+            # Build remediation steps based on threat level
+            if threat_level == 'malicious':
+                remediation = [
+                    f"QUARANTINE IMMEDIATELY: {file_info.path}",
+                    "Extract and analyze hidden content in sandbox",
+                    "Run full system malware scan",
+                    "Check for related compromise indicators",
+                    "Preserve image for forensic analysis"
+                ]
+            elif threat_level == 'suspicious':
+                remediation = [
+                    f"Investigate image source: {file_info.path}",
+                    "Extract and analyze hidden content",
+                    "Check indicators against threat intelligence",
+                    "Quarantine if verification fails",
+                    "Monitor for related network activity"
+                ]
+            else:
+                remediation = [
+                    "Verify image source and legitimacy",
+                    "Extract and analyze hidden data",
+                    "Check for benign steganography uses",
+                    f"Quarantine if suspicious: {file_info.path}"
+                ]
+            
             detection = Detection(
                 detection_id=self._generate_detection_id(),
-                detection_type='steganography',
+                detection_type=detection_type,
                 indicator=file_info.name,
                 indicator_type='file',
-                risk_level=RiskLevel.MEDIUM,
-                confidence=0.5,
-                description="Possible steganography detected in image",
-                detection_reason=f"LSB analysis indicates hidden data",
-                remediation=[
-                    "Verify image source",
-                    "Extract and analyze hidden data",
-                    f"Quarantine if suspicious: {file_info.path}"
-                ],
+                risk_level=risk_level,
+                confidence=confidence,
+                description=description,
+                detection_reason=detection_reason,
+                remediation=remediation,
                 file_path=str(file_info.path),
-                evidence={
-                    'lsb_analysis': stego_result.get('lsb_analysis', {}),
-                    'entropy_analysis': stego_result.get('entropy_analysis', {}),
-                    'warnings': stego_result.get('warnings', [])
-                }
+                evidence=evidence
             )
             detections.append(detection)
         

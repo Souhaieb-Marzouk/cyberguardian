@@ -402,7 +402,114 @@ class RegistryScanner(BaseScanner):
             except Exception as e:
                 self.logger.debug(f"Detection method error: {e}")
         
+        # If detections found, collect full key evidence for AI analysis
+        if detections:
+            full_key_evidence = self._collect_key_evidence(entry)
+            param_count = full_key_evidence.get('parameter_count', 0)
+            self.logger.info(f"Registry detection in {entry.key_path}: collected {param_count} parameters as evidence for AI analysis")
+            for detection in detections:
+                if detection.evidence:
+                    detection.evidence['full_key_parameters'] = full_key_evidence
+        
         return detections
+    
+    def _collect_key_evidence(self, entry: RegistryEntry) -> Dict[str, Any]:
+        """
+        Collect all parameters and values from a registry key as evidence.
+        
+        This provides complete context for AI analysis when a suspicious
+        value is found in a registry key.
+        
+        Args:
+            entry: The suspicious registry entry
+        
+        Returns:
+            Dictionary with all key parameters and their values
+        """
+        evidence = {
+            'key_path': entry.key_path,
+            'suspicious_value_name': entry.value_name,
+            'suspicious_value_data': entry.value_data[:500],
+            'all_parameters': [],
+            'parameter_count': 0
+        }
+        
+        try:
+            import winreg
+            
+            # Parse the key path to get hive and subkey
+            parts = entry.key_path.split('\\', 1)
+            if len(parts) < 2:
+                return evidence
+            
+            hive_name = parts[0]
+            subkey_path = parts[1]
+            
+            hive = self._get_hive(hive_name)
+            if hive is None:
+                return evidence
+            
+            # Open the key and enumerate all values
+            key = winreg.OpenKey(hive, subkey_path, 0, winreg.KEY_READ)
+            
+            # Type names for display
+            type_names = {
+                winreg.REG_SZ: 'REG_SZ',
+                winreg.REG_EXPAND_SZ: 'REG_EXPAND_SZ',
+                winreg.REG_BINARY: 'REG_BINARY',
+                winreg.REG_DWORD: 'REG_DWORD',
+                winreg.REG_MULTI_SZ: 'REG_MULTI_SZ',
+                winreg.REG_QWORD: 'REG_QWORD',
+            }
+            
+            i = 0
+            while True:
+                try:
+                    value_name, value_data, value_type = winreg.EnumValue(key, i)
+                    
+                    # Convert data to string
+                    if isinstance(value_data, bytes):
+                        try:
+                            value_data_str = value_data.decode('utf-8', errors='replace')
+                        except:
+                            value_data_str = value_data.hex()
+                    elif isinstance(value_data, tuple):
+                        value_data_str = '; '.join(str(v) for v in value_data)
+                    elif isinstance(value_data, int):
+                        value_data_str = str(value_data)
+                    else:
+                        value_data_str = str(value_data)
+                    
+                    type_str = type_names.get(value_type, f'TYPE_{value_type}')
+                    
+                    param_info = {
+                        'name': value_name or '(Default)',
+                        'type': type_str,
+                        'value': value_data_str[:1000]  # Limit length
+                    }
+                    
+                    # Mark if this is the suspicious one
+                    if value_name == entry.value_name:
+                        param_info['is_suspicious'] = True
+                    
+                    evidence['all_parameters'].append(param_info)
+                    i += 1
+                    
+                except OSError:
+                    break
+            
+            winreg.CloseKey(key)
+            
+            evidence['parameter_count'] = len(evidence['all_parameters'])
+            
+        except FileNotFoundError:
+            evidence['error'] = 'Key not found'
+        except PermissionError:
+            evidence['error'] = 'Permission denied'
+        except Exception as e:
+            evidence['error'] = str(e)
+        
+        return evidence
     
     def _is_trusted_entry(self, entry: RegistryEntry) -> bool:
         """Check if entry is in trusted list."""

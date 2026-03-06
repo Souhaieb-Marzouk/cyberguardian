@@ -3,6 +3,8 @@ CyberGuardian Process Scanner Module
 ====================================
 Scans running processes for malicious indicators
 using Yara, behavioral heuristics, hash lookup, and signature verification.
+
+Enhanced with Deep Analysis Mode for memory forensics.
 """
 
 import os
@@ -25,6 +27,14 @@ from utils.whitelist import get_whitelist
 from utils.config import get_config
 from utils.logging_utils import get_logger, log_scan_start, log_scan_complete, log_detection
 from threat_intel.intel import get_threat_intel
+
+# Import memory analyzer for deep analysis
+try:
+    from scanners.memory_analyzer import MemoryAnalyzer, is_memory_analysis_available
+    MEMORY_ANALYSIS_AVAILABLE = is_memory_analysis_available()
+except ImportError:
+    MEMORY_ANALYSIS_AVAILABLE = False
+    logging.warning("Memory analyzer not available - deep analysis will be limited")
 
 logger = get_logger('scanners.process_scanner')
 
@@ -62,6 +72,13 @@ class ProcessScanner(BaseScanner):
     - Hash lookup (VirusTotal)
     - Digital signature verification
     - Whitelist checking
+    
+    Deep Analysis Mode:
+    - Memory region analysis
+    - String extraction from process memory
+    - Code injection detection
+    - IOC extraction from memory
+    - YARA memory scanning
     """
     
     # Suspicious parent-child process relationships
@@ -124,6 +141,15 @@ class ProcessScanner(BaseScanner):
     MEMORY_THRESHOLD_PERCENT = 30.0
     HIGH_RESOURCE_DURATION_SECONDS = 30
     
+    # Processes to prioritize for memory analysis
+    MEMORY_ANALYSIS_PRIORITIES = {
+        'powershell.exe', 'cmd.exe', 'wscript.exe', 'cscript.exe',
+        'mshta.exe', 'regsvr32.exe', 'rundll32.exe',
+        'svchost.exe', 'explorer.exe', 'winlogon.exe',
+        'lsass.exe', 'csrss.exe', 'wininit.exe',
+        'chrome.exe', 'firefox.exe', 'msedge.exe',
+    }
+    
     def __init__(self):
         super().__init__()
         self.config = get_config()
@@ -134,12 +160,17 @@ class ProcessScanner(BaseScanner):
         self._process_cache: Dict[int, ProcessInfo] = {}
         self._resource_history: Dict[int, List[Tuple[float, float, float]]] = {}
         self._scanned_hashes: Set[str] = set()  # Track scanned hashes to avoid duplicates within same scan
+        self._memory_analyzer: Optional[MemoryAnalyzer] = None
+        self._deep_analysis = False
+        self._memory_analysis_count = 0  # Track how many processes had memory analysis
     
     def _reset_scan_state(self):
         """Reset internal state before a new scan."""
         self._process_cache.clear()
         self._resource_history.clear()
         self._scanned_hashes.clear()
+        self._deep_analysis = False
+        self._memory_analysis_count = 0
     
     @property
     def scanner_name(self) -> str:
@@ -149,12 +180,13 @@ class ProcessScanner(BaseScanner):
     def scanner_type(self) -> str:
         return "process"
     
-    def scan(self, target: Optional[int] = None) -> ScanResult:
+    def scan(self, target: Optional[int] = None, deep_analysis: bool = False) -> ScanResult:
         """
         Scan running processes.
         
         Args:
             target: Optional specific PID to scan
+            deep_analysis: Enable comprehensive memory forensics
         
         Returns:
             ScanResult with process analysis findings
@@ -163,6 +195,7 @@ class ProcessScanner(BaseScanner):
         
         # Reset internal state for fresh scan
         self._reset_scan_state()
+        self._deep_analysis = deep_analysis
         
         result = ScanResult(
             scan_type='process',
@@ -173,12 +206,24 @@ class ProcessScanner(BaseScanner):
         
         self.reset_cancel()
         
+        # Initialize memory analyzer for deep analysis
+        if deep_analysis and MEMORY_ANALYSIS_AVAILABLE:
+            try:
+                self._memory_analyzer = MemoryAnalyzer()
+                self.logger.info("Memory analyzer initialized for deep analysis")
+                self._report_progress(0, 100, "Memory analyzer initialized - Deep Analysis Mode enabled")
+            except Exception as e:
+                self.logger.warning(f"Could not initialize memory analyzer: {e}")
+                self._memory_analyzer = None
+        elif deep_analysis and not MEMORY_ANALYSIS_AVAILABLE:
+            self.logger.warning("Deep analysis requested but memory analysis is not available (requires Windows with psutil)")
+        
         try:
             # Get process list
             processes = self._enumerate_processes(target)
             result.total_items = len(processes)
             
-            self.logger.info(f"Scanning {len(processes)} processes")
+            self.logger.info(f"Scanning {len(processes)} processes (deep_analysis={deep_analysis})")
             
             # Analyze each process
             for i, proc_info in enumerate(processes):
@@ -208,13 +253,40 @@ class ProcessScanner(BaseScanner):
                 
                 if not detections:
                     result.clean_items += 1
+                
+                # Deep analysis for high-priority or suspicious processes
+                if deep_analysis and self._memory_analyzer:
+                    if self._should_analyze_memory(proc_info, detections):
+                        self._memory_analysis_count += 1
+                        memory_detections = self._analyze_process_memory(proc_info, i, len(processes))
+                        for detection in memory_detections:
+                            result.add_detection(detection)
+                            self._report_detection(detection)
+                            log_detection(
+                                detection_type=detection.detection_type,
+                                indicator=detection.indicator,
+                                risk_level=detection.risk_level.value,
+                                description=detection.description
+                            )
             
             result.status = ScanStatus.COMPLETED
+            
+            # Log deep analysis summary
+            if deep_analysis and self._memory_analyzer:
+                self.logger.info(f"[DEEP ANALYSIS] Memory forensics completed: analyzed {self._memory_analysis_count} processes")
             
         except Exception as e:
             self.logger.error(f"Process scan error: {e}")
             result.status = ScanStatus.FAILED
             result.error_message = str(e)
+        
+        finally:
+            # Cleanup memory analyzer
+            if self._memory_analyzer:
+                try:
+                    self._memory_analyzer.secure_cleanup()
+                except:
+                    pass
         
         result.end_time = datetime.utcnow()
         result.scan_duration_seconds = (result.end_time - result.start_time).total_seconds()
@@ -222,6 +294,238 @@ class ProcessScanner(BaseScanner):
         log_scan_complete('process', result.scan_target, len(result.detections))
         
         return result
+    
+    def _should_analyze_memory(self, proc_info: ProcessInfo, detections: List[Detection]) -> bool:
+        """Determine if a process should have memory analysis."""
+        # Always analyze if there were detections
+        if detections:
+            self.logger.debug(f"Memory analysis triggered for {proc_info.name}: has detections")
+            return True
+        
+        # Analyze high-priority processes
+        if proc_info.name.lower() in self.MEMORY_ANALYSIS_PRIORITIES:
+            self.logger.debug(f"Memory analysis triggered for {proc_info.name}: high-priority process")
+            return True
+        
+        # Analyze unsigned executables
+        if not proc_info.is_signed and proc_info.path:
+            self.logger.debug(f"Memory analysis triggered for {proc_info.name}: unsigned executable")
+            return True
+        
+        # Analyze processes with suspicious resource usage
+        if proc_info.cpu_percent > 50 or proc_info.memory_percent > 20:
+            self.logger.debug(f"Memory analysis triggered for {proc_info.name}: high resource usage (CPU: {proc_info.cpu_percent}%, MEM: {proc_info.memory_percent}%)")
+            return True
+        
+        return False
+    
+    def _analyze_process_memory(self, proc_info: ProcessInfo, current_index: int, 
+                                total_processes: int) -> List[Detection]:
+        """
+        Perform deep memory analysis on a process.
+        
+        Args:
+            proc_info: Process information
+            current_index: Current progress index
+            total_processes: Total processes to scan
+        
+        Returns:
+            List of detections from memory analysis
+        """
+        detections = []
+        
+        if not self._memory_analyzer:
+            return detections
+        
+        # Log that memory analysis is starting
+        self.logger.info(f"[DEEP ANALYSIS] Starting memory analysis for {proc_info.name} (PID: {proc_info.pid})")
+        
+        try:
+            # Progress callback wrapper
+            def progress_callback(current, total, message):
+                if self.is_cancelled():
+                    return
+                overall_progress = current_index + (current / total)
+                self._report_progress(
+                    overall_progress, 
+                    total_processes, 
+                    f"Memory scan {proc_info.name}: {message}"
+                )
+            
+            # Perform memory analysis
+            memory_result = self._memory_analyzer.analyze_process(
+                proc_info.pid, 
+                progress_callback=progress_callback
+            )
+            
+            # Check for code injection
+            for injection in memory_result.injected_code:
+                risk_level = RiskLevel.HIGH if injection.confidence >= 0.7 else RiskLevel.MEDIUM
+                
+                detection = Detection(
+                    detection_id=self._generate_detection_id(),
+                    detection_type=f'memory_{injection.injection_type.lower()}',
+                    indicator=f"{proc_info.name} (0x{injection.memory_address:X})",
+                    indicator_type='process',
+                    risk_level=risk_level,
+                    confidence=injection.confidence,
+                    description=f"Code injection detected in {proc_info.name}: {injection.injection_type}",
+                    detection_reason=f"{injection.injection_type} at address 0x{injection.memory_address:X}",
+                    remediation=[
+                        f"Terminate process immediately (PID: {proc_info.pid})",
+                        f"Analyze injected code at 0x{injection.memory_address:X}",
+                        "Scan system for rootkits",
+                        "Check for process hollowing or DLL injection"
+                    ],
+                    process_name=proc_info.name,
+                    process_id=proc_info.pid,
+                    file_path=proc_info.path,
+                    command_line=proc_info.command_line,
+                    user=proc_info.username,
+                    evidence=injection.evidence
+                )
+                detections.append(detection)
+            
+            # Check for suspicious memory regions
+            for region in memory_result.suspicious_regions[:5]:  # Limit to top 5
+                detection = Detection(
+                    detection_id=self._generate_detection_id(),
+                    detection_type='memory_suspicious_region',
+                    indicator=f"{proc_info.name} (0x{region.base_address:X})",
+                    indicator_type='process',
+                    risk_level=RiskLevel.MEDIUM,
+                    confidence=0.6,
+                    description=f"Suspicious memory region in {proc_info.name}: {', '.join(region.suspicion_reasons)}",
+                    detection_reason=f"Region at 0x{region.base_address:X}: {', '.join(region.suspicion_reasons)}",
+                    remediation=[
+                        f"Investigate process (PID: {proc_info.pid})",
+                        "Check for code injection",
+                        "Analyze memory contents"
+                    ],
+                    process_name=proc_info.name,
+                    process_id=proc_info.pid,
+                    evidence={
+                        'base_address': f'0x{region.base_address:X}',
+                        'region_size': region.region_size,
+                        'protection': region.protection,
+                        'memory_type': region.memory_type,
+                        'reasons': region.suspicion_reasons
+                    }
+                )
+                detections.append(detection)
+            
+            # Check for suspicious IOCs from memory
+            for ioc in memory_result.iocs:
+                if ioc.confidence >= 0.7:
+                    detection = Detection(
+                        detection_id=self._generate_detection_id(),
+                        detection_type=f'memory_ioc_{ioc.ioc_type.lower()}',
+                        indicator=ioc.value,
+                        indicator_type='network' if ioc.ioc_type in ['URL', 'IP', 'DOMAIN'] else 'string',
+                        risk_level=RiskLevel.MEDIUM if ioc.confidence >= 0.8 else RiskLevel.LOW,
+                        confidence=ioc.confidence,
+                        description=f"Suspicious {ioc.ioc_type} found in {proc_info.name} memory: {ioc.value[:50]}",
+                        detection_reason=f"Extracted from process memory at 0x{ioc.memory_address:X}",
+                        remediation=[
+                            f"Investigate {ioc.ioc_type}: {ioc.value}",
+                            "Check if connection was made to this address",
+                            "Analyze process for malware"
+                        ],
+                        process_name=proc_info.name,
+                        process_id=proc_info.pid,
+                        evidence={
+                            'ioc_type': ioc.ioc_type,
+                            'ioc_value': ioc.value,
+                            'memory_address': f'0x{ioc.memory_address:X}',
+                            'context': ioc.context[:200] if ioc.context else ''
+                        }
+                    )
+                    detections.append(detection)
+            
+            # Check for suspicious strings
+            suspicious_strings = [s for s in memory_result.extracted_strings if s.is_suspicious]
+            if len(suspicious_strings) > 10:
+                # Group similar strings
+                unique_patterns = set()
+                for s in suspicious_strings[:20]:
+                    if len(s.value) > 10:
+                        pattern = s.value[:50]
+                        unique_patterns.add(pattern)
+                
+                if unique_patterns:
+                    detection = Detection(
+                        detection_id=self._generate_detection_id(),
+                        detection_type='memory_suspicious_strings',
+                        indicator=proc_info.name,
+                        indicator_type='process',
+                        risk_level=RiskLevel.MEDIUM,
+                        confidence=0.6,
+                        description=f"Multiple suspicious strings in {proc_info.name} memory ({len(suspicious_strings)} found)",
+                        detection_reason=f"Found suspicious strings indicating potential malware behavior",
+                        remediation=[
+                            f"Investigate process (PID: {proc_info.pid})",
+                            "Analyze detected strings for malware indicators",
+                            "Consider quarantining the process"
+                        ],
+                        process_name=proc_info.name,
+                        process_id=proc_info.pid,
+                        evidence={
+                            'string_count': len(suspicious_strings),
+                            'sample_strings': [s.value[:100] for s in suspicious_strings[:10]]
+                        }
+                    )
+                    detections.append(detection)
+            
+            # YARA memory scanning for high-risk processes
+            if detections or proc_info.name.lower() in self.MEMORY_ANALYSIS_PRIORITIES:
+                try:
+                    yara_matches = self._memory_analyzer.scan_memory_with_yara(
+                        proc_info.pid,
+                        self.yara_manager.get_compiled_rules() if hasattr(self.yara_manager, 'get_compiled_rules') else None,
+                        progress_callback=progress_callback
+                    )
+                    
+                    for match in yara_matches:
+                        rule_name = match.get('rule', 'Unknown')
+                        detection = Detection(
+                            detection_id=self._generate_detection_id(),
+                            detection_type='memory_yara_match',
+                            indicator=f"{proc_info.name}:{rule_name}",
+                            indicator_type='process',
+                            risk_level=RiskLevel.HIGH,
+                            confidence=0.85,
+                            description=f"YARA rule matched in {proc_info.name} memory: {rule_name}",
+                            detection_reason=f"YARA rule '{rule_name}' matched at {match.get('memory_address', 'unknown')}",
+                            remediation=[
+                                f"Terminate process (PID: {proc_info.pid})",
+                                f"Analyze matched rule: {rule_name}",
+                                "Full memory dump recommended"
+                            ],
+                            process_name=proc_info.name,
+                            process_id=proc_info.pid,
+                            evidence={
+                                'rule': rule_name,
+                                'memory_address': match.get('memory_address'),
+                                'matched_strings': match.get('strings', [])[:5],
+                                'meta': match.get('meta', {})
+                            }
+                        )
+                        detections.append(detection)
+                        
+                except Exception as e:
+                    self.logger.debug(f"YARA memory scan error for {proc_info.name}: {e}")
+        
+        except Exception as e:
+            self.logger.debug(f"Memory analysis error for {proc_info.name} (PID {proc_info.pid}): {e}")
+        
+        # Log memory analysis results with detailed statistics
+        if detections:
+            self.logger.info(f"[DEEP ANALYSIS] Memory analysis for {proc_info.name} (PID {proc_info.pid}): found {len(detections)} detections")
+        else:
+            # Log completion even if no detections found (for verification that analysis ran)
+            self.logger.info(f"[DEEP ANALYSIS] Memory analysis completed for {proc_info.name} (PID {proc_info.pid}): no suspicious findings")
+        
+        return detections
     
     def _enumerate_processes(self, target_pid: Optional[int] = None) -> List[ProcessInfo]:
         """Enumerate all running processes and gather info."""

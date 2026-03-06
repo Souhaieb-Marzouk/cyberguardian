@@ -58,6 +58,17 @@ except ImportError:
     AI_ANALYSIS_AVAILABLE = False
     logging.warning("AI analysis module not available")
 
+# Import VirusTotal checker
+try:
+    from threat_intel.virustotal_checker import (
+        get_virustotal_checker, is_virustotal_available,
+        VirusTotalChecker, IOCResult
+    )
+    VIRUSTOTAL_AVAILABLE = True
+except ImportError:
+    VIRUSTOTAL_AVAILABLE = False
+    logging.warning("VirusTotal checker module not available")
+
 logger = get_logger('ui.main_window')
 
 
@@ -428,10 +439,11 @@ class ScanWorker(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
     
-    def __init__(self, scanner, target=None):
+    def __init__(self, scanner, target=None, deep_analysis=False):
         super().__init__()
         self.scanner = scanner
         self.target = target
+        self.deep_analysis = deep_analysis
         self._is_cancelled = False
     
     def run(self):
@@ -440,7 +452,14 @@ class ScanWorker(QThread):
             self.scanner.reset_cancel()
             self.scanner.set_progress_callback(self._on_progress)
             self.scanner.set_detection_callback(self._on_detection)
-            result = self.scanner.scan(self.target)
+            
+            # Pass deep_analysis flag to scanner if it supports it
+            import inspect
+            scan_sig = inspect.signature(self.scanner.scan)
+            if 'deep_analysis' in scan_sig.parameters:
+                result = self.scanner.scan(self.target, deep_analysis=self.deep_analysis)
+            else:
+                result = self.scanner.scan(self.target)
             
             # Check if scan was cancelled
             if self.scanner.is_cancelled():
@@ -653,11 +672,45 @@ class DetectionDialog(QDialog):
         self.ai_result: Optional[Any] = None
         self.ai_worker: Optional[AIAnalysisWorker] = None
         self._dialog_closing = False
+        self._is_whitelisted = False  # Track whitelist status
+        self.whitelist_btn: Optional[QPushButton] = None  # Store button reference
         
         self.setWindowTitle(f"Detection Details - {detection.detection_type}")
         self.setMinimumSize(950, 850)
         self.resize(1000, 900)
+        self._check_whitelist_status()
         self.setup_ui()
+    
+    def _check_whitelist_status(self):
+        """Check if the detection is already whitelisted."""
+        try:
+            whitelist = get_whitelist()
+            
+            # Check various identifiers
+            identifiers_to_check = []
+            
+            if self.detection.file_path:
+                identifiers_to_check.append(self.detection.file_path)
+            if self.detection.process_name:
+                identifiers_to_check.append(self.detection.process_name)
+            if self.detection.indicator:
+                identifiers_to_check.append(self.detection.indicator)
+            if self.detection.evidence:
+                if 'key_path' in self.detection.evidence:
+                    identifiers_to_check.append(self.detection.evidence['key_path'])
+                if 'sha256' in self.detection.evidence:
+                    identifiers_to_check.append(self.detection.evidence['sha256'])
+            
+            # Check if any identifier is whitelisted
+            for identifier in identifiers_to_check:
+                if whitelist.is_whitelisted(identifier):
+                    self._is_whitelisted = True
+                    return
+            
+            self._is_whitelisted = False
+        except Exception as e:
+            logger.debug(f"Error checking whitelist status: {e}")
+            self._is_whitelisted = False
     
     def closeEvent(self, event):
         """Handle dialog close event - clean up worker thread."""
@@ -1025,7 +1078,17 @@ class DetectionDialog(QDialog):
         whitelist_btn = QPushButton(" Add to Whitelist")
         whitelist_btn.setMinimumHeight(40)
         whitelist_btn.setFont(QFont('Consolas', 11, QFont.Bold))
-        whitelist_btn.clicked.connect(lambda: self._request_action("add_whitelist"))
+        
+        # Set initial text and action based on whitelist status
+        if self._is_whitelisted:
+            whitelist_btn.setText(" Remove from Whitelist")
+            whitelist_btn.clicked.connect(lambda: self._request_action("remove_whitelist"))
+        else:
+            whitelist_btn.setText(" Add to Whitelist")
+            whitelist_btn.clicked.connect(lambda: self._request_action("add_whitelist"))
+        
+        # Store reference for later updates
+        self.whitelist_btn = whitelist_btn
         actions_layout.addWidget(whitelist_btn)
         
         if self.detection.file_path:
@@ -1151,7 +1214,7 @@ class DetectionDialog(QDialog):
         return colors.get(self.detection.risk_level, CYBER_COLORS['text'])
     
     def _start_ai_analysis(self):
-        """Start AI analysis in background."""
+        """Start AI analysis in background with VirusTotal IOC checking."""
         if not AI_ANALYSIS_AVAILABLE:
             QMessageBox.warning(self, "Not Available", "AI analysis module not available.")
             return
@@ -1192,11 +1255,125 @@ class DetectionDialog(QDialog):
             'user': self.detection.user or '',
         }
         
+        # Check IOCs against VirusTotal if API key is configured
+        vt_result = None
+        original_risk_level = self.detection.risk_level
+        
+        if VIRUSTOTAL_AVAILABLE and is_virustotal_available():
+            try:
+                self.ai_progress_label.setText("Checking IOCs against VirusTotal...")
+                self.ai_progress_label.setStyleSheet(f"color: {CYBER_COLORS['secondary']}; font-size: 12px; padding: 5px;")
+                
+                vt_checker = get_virustotal_checker()
+                
+                # Check the main indicator and any IOCs from evidence
+                vt_result = vt_checker.check_iocs_from_detection(
+                    indicator=self.detection.indicator,
+                    detection_type=self.detection.detection_type,
+                    evidence=self.detection.evidence or {}
+                )
+                
+                # Add VirusTotal results to detection data for AI analysis
+                detection_data['virustotal_result'] = {
+                    'iocs_checked': vt_result.iocs_checked,
+                    'iocs_malicious': vt_result.iocs_malicious,
+                    'iocs_clean': vt_result.iocs_clean,
+                    'overall_risk_adjustment': vt_result.overall_risk_adjustment,
+                    'highest_risk_level': vt_result.highest_risk_level,
+                    'vt_summary': vt_result.vt_summary,
+                    'all_iocs': vt_result.all_iocs,
+                    # Include detailed malicious results (only malicious items)
+                    'hash_results': [
+                        {
+                            'hash_value': r.hash_value[:16] + '...',
+                            'is_malicious': r.is_malicious,
+                            'detection_ratio': r.detection_ratio,
+                            'malicious_count': r.malicious_count,
+                            'total_engines': r.total_engines,
+                            'threat_names': r.threat_names[:5],
+                            'file_type': r.file_type
+                        } for r in vt_result.hash_results if r.is_malicious
+                    ],
+                    'ip_results': [
+                        {
+                            'ip_address': r.ip_address,
+                            'is_malicious': r.is_malicious,
+                            'detection_ratio': r.detection_ratio,
+                            'malicious_count': r.malicious_count,
+                            'total_engines': r.total_engines,
+                            'country': r.country,
+                            'as_owner': r.as_owner,
+                            'threat_names': r.threat_names[:5]
+                        } for r in vt_result.ip_results if r.is_malicious
+                    ],
+                    'domain_results': [
+                        {
+                            'domain': r.domain,
+                            'is_malicious': r.is_malicious,
+                            'detection_ratio': r.detection_ratio,
+                            'categories': r.categories
+                        } for r in vt_result.domain_results if r.is_malicious
+                    ],
+                    'url_results': [
+                        {
+                            'url': r.url[:50] + '...' if len(r.url) > 50 else r.url,
+                            'is_malicious': r.is_malicious,
+                            'detection_ratio': r.detection_ratio
+                        } for r in vt_result.url_results if r.is_malicious
+                    ]
+                }
+                
+                # Log detailed VT results for debugging
+                logger.info(f"[VT DEBUG] IOCs found in evidence: {vt_result.all_iocs}")
+                for ip_r in vt_result.ip_results:
+                    logger.info(f"[VT DEBUG] IP {ip_r.ip_address}: is_malicious={ip_r.is_malicious}, ratio={ip_r.detection_ratio}, malicious_count={ip_r.malicious_count}")
+                
+                # Adjust risk level based on VirusTotal results
+                if vt_result.iocs_malicious > 0:
+                    from scanners.base_scanner import RiskLevel
+                    
+                    # Determine new risk level based on VT findings
+                    if vt_result.highest_risk_level == 'critical':
+                        detection_data['risk_level'] = 'critical'
+                        detection_data['risk_adjusted_by_vt'] = True
+                        detection_data['original_risk_level'] = original_risk_level.value
+                    elif vt_result.highest_risk_level == 'high':
+                        if original_risk_level not in [RiskLevel.CRITICAL]:
+                            detection_data['risk_level'] = 'high'
+                            detection_data['risk_adjusted_by_vt'] = True
+                            detection_data['original_risk_level'] = original_risk_level.value
+                    elif vt_result.highest_risk_level == 'medium':
+                        if original_risk_level not in [RiskLevel.CRITICAL, RiskLevel.HIGH]:
+                            detection_data['risk_level'] = 'medium'
+                            detection_data['risk_adjusted_by_vt'] = True
+                            detection_data['original_risk_level'] = original_risk_level.value
+                    
+                    logger.info(f"[VIRUSTOTAL] Risk adjusted: {original_risk_level.value} -> {detection_data['risk_level']} based on {vt_result.iocs_malicious} malicious IOCs")
+                
+            except Exception as e:
+                logger.warning(f"VirusTotal IOC check failed: {e}")
+                vt_result = None
+        
         # Start worker
         self.ai_analyze_btn.setEnabled(False)
         self.ai_analyze_btn.setText(" ANALYZING...")
-        self.ai_progress_label.setText("Connecting to AI provider and analyzing detection...")
+        
+        # Build status message
+        status_msg = "Analyzing detection with AI..."
+        vt_info = ""
+        if vt_result and vt_result.iocs_checked > 0:
+            status_msg = f"VT: {vt_result.iocs_checked} IOCs checked ({vt_result.iocs_malicious} malicious). Analyzing with AI..."
+            vt_info = f"\n\nVirusTotal Results:\n"
+            vt_info += f"  • IOCs Checked: {vt_result.iocs_checked}\n"
+            vt_info += f"  • Malicious: {vt_result.iocs_malicious}\n"
+            vt_info += f"  • Clean: {vt_result.iocs_clean}\n"
+            vt_info += f"  • Highest Risk: {vt_result.highest_risk_level.upper()}\n"
+            if vt_result.vt_summary:
+                vt_info += f"\n  Summary: {vt_result.vt_summary[:200]}\n"
+        
+        self.ai_progress_label.setText(status_msg)
         self.ai_progress_label.setStyleSheet(f"color: {CYBER_COLORS['secondary']}; font-size: 12px; padding: 5px;")
+        
         self.ai_result_text.setPlainText(
             "════════════════════════════════════════════════════════════\n"
             "                    ANALYZING DETECTION...\n"
@@ -1207,7 +1384,7 @@ class DetectionDialog(QDialog):
             "Analyzing:\n"
             f"  • Detection Type: {self.detection.detection_type}\n"
             f"  • Risk Level: {self.detection.risk_level.value.upper()}\n"
-            f"  • Indicator: {self.detection.indicator[:50]}..."
+            f"  • Indicator: {self.detection.indicator[:50]}...{vt_info}"
         )
         
         self.ai_worker = AIAnalysisWorker(detection_data, provider)
@@ -1369,6 +1546,27 @@ class DetectionDialog(QDialog):
     
     def _request_action(self, action: str):
         self.action_requested.emit(action, self.detection)
+    
+    def update_whitelist_button(self, is_whitelisted: bool):
+        """Update the whitelist button after an action is completed.
+        
+        Args:
+            is_whitelisted: True if the detection is now whitelisted
+        """
+        self._is_whitelisted = is_whitelisted
+        if self.whitelist_btn:
+            # Disconnect old connections
+            try:
+                self.whitelist_btn.clicked.disconnect()
+            except:
+                pass
+            
+            if is_whitelisted:
+                self.whitelist_btn.setText(" Remove from Whitelist")
+                self.whitelist_btn.clicked.connect(lambda: self._request_action("remove_whitelist"))
+            else:
+                self.whitelist_btn.setText(" Add to Whitelist")
+                self.whitelist_btn.clicked.connect(lambda: self._request_action("add_whitelist"))
     
     def _export_ai_analysis_html(self):
         """Export AI analysis results to an HTML file with cyber theme."""
@@ -2937,46 +3135,61 @@ class MainWindow(QMainWindow):
         self.settings.setValue('geometry', self.saveGeometry())
     
     def start_process_scan(self):
-        """Start process scan."""
-        self.start_scan(self.process_scanner, "Process Analysis")
+        """Start process scan with deep analysis support."""
+        deep_analysis = self.deep_analysis_checkbox.isChecked() and self.is_admin
+        self.start_scan(self.process_scanner, "Process Analysis", deep_analysis=deep_analysis)
     
     def start_file_scan(self):
-        """Start file scan."""
+        """Start file scan with deep analysis support."""
+        deep_analysis = self.deep_analysis_checkbox.isChecked() and self.is_admin
+        
         folder = QFileDialog.getExistingDirectory(
             self, "Select Folder to Scan", "",
             QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
         )
         
         if folder:
-            self.start_scan(self.file_scanner, "File Analysis", folder)
+            self.start_scan(self.file_scanner, "File Analysis", folder, deep_analysis=deep_analysis)
         else:
             file_path, _ = QFileDialog.getOpenFileName(
                 self, "Select File to Scan", "",
                 "All Files (*.*)"
             )
             if file_path:
-                self.start_scan(self.file_scanner, "File Analysis", file_path)
+                self.start_scan(self.file_scanner, "File Analysis", file_path, deep_analysis=deep_analysis)
     
     def start_registry_scan(self):
-        """Start registry scan."""
-        self.start_scan(self.registry_scanner, "Registry Analysis")
+        """Start registry scan with deep analysis support."""
+        deep_analysis = self.deep_analysis_checkbox.isChecked() and self.is_admin
+        self.start_scan(self.registry_scanner, "Registry Analysis", deep_analysis=deep_analysis)
     
     def start_network_scan(self):
-        """Start network scan."""
-        self.start_scan(self.network_scanner, "Network Analysis")
+        """Start network scan with deep analysis support."""
+        deep_analysis = self.deep_analysis_checkbox.isChecked() and self.is_admin
+        self.start_scan(self.network_scanner, "Network Analysis", deep_analysis=deep_analysis)
     
-    def start_scan(self, scanner, scan_name: str, target=None):
-        """Start a scan in background thread."""
+    def start_scan(self, scanner, scan_name: str, target=None, deep_analysis=False):
+        """Start a scan in background thread.
+        
+        Args:
+            scanner: The scanner instance to use
+            scan_name: Human-readable name for the scan
+            target: Optional target (file path, IP, etc.)
+            deep_analysis: Enable deep/forensic analysis mode
+        """
         self.set_ui_busy(True)
         self._current_scan_name = scan_name
-        self.status_label.setText(f"Running {scan_name}...")
+        self.status_label.setText(f"Running {scan_name}{' (Deep Analysis)' if deep_analysis else ''}...")
         
         # Show stop button
         self.stop_btn.setVisible(True)
         
-        self.log(f"Starting {scan_name}...")
+        if deep_analysis:
+            self.log(f"Starting {scan_name} with Deep Analysis mode...")
+        else:
+            self.log(f"Starting {scan_name}...")
         
-        self.current_worker = ScanWorker(scanner, target)
+        self.current_worker = ScanWorker(scanner, target, deep_analysis=deep_analysis)
         self.current_worker.progress.connect(self.on_scan_progress)
         self.current_worker.detection.connect(self.on_detection)
         self.current_worker.finished.connect(self.on_scan_finished)
@@ -3183,6 +3396,8 @@ class MainWindow(QMainWindow):
                 self._quarantine_file(detection)
             elif action == "add_whitelist":
                 self._add_to_whitelist(detection)
+            elif action == "remove_whitelist":
+                self._remove_from_whitelist(detection)
             elif action == "open_location":
                 self._open_file_location(detection)
         except Exception as e:
@@ -3339,11 +3554,85 @@ class MainWindow(QMainWindow):
                 self.log(f"Added to whitelist: {entry_type}={identifier[:50]}")
                 QMessageBox.information(self, "Success", "Entry added to whitelist.")
                 self.refresh_whitelist()
+                
+                # Store the identifier on the detection for later removal
+                detection._whitelist_identifier = identifier
+                detection._whitelist_entry_type = entry_type
+                
+                # Notify any open dialogs to update their buttons
+                self._notify_whitelist_change(detection, True)
         else:
             QMessageBox.warning(self, "Cannot Add", 
                 f"No suitable identifier found for whitelisting.\n\n"
                 f"Detection type: {detection.detection_type}\n"
                 f"Indicator: {detection.indicator[:50] if detection.indicator else 'N/A'}")
+    
+    def _remove_from_whitelist(self, detection: Detection):
+        """Remove detection indicator from whitelist."""
+        whitelist = get_whitelist()
+        
+        identifier = getattr(detection, '_whitelist_identifier', None)
+        entry_type = getattr(detection, '_whitelist_entry_type', None)
+        
+        # If not stored, try to determine it again
+        if not identifier:
+            # Check for file path
+            if detection.file_path:
+                identifier = detection.file_path
+                entry_type = 'path'
+            elif detection.process_name:
+                identifier = detection.process_name
+                entry_type = 'name'
+            elif detection.indicator_type == 'registry_key' or 'registry' in detection.detection_type.lower():
+                key_path = detection.indicator
+                if detection.evidence:
+                    key_path = detection.evidence.get('key_path', key_path) or key_path
+                if key_path:
+                    identifier = key_path
+                    entry_type = 'registry_key'
+            elif detection.indicator:
+                identifier = detection.indicator
+                if identifier.startswith(('HKEY_', 'HKLM', 'HKCU', 'HKCR', 'HKU', 'HKCC')):
+                    entry_type = 'registry_key'
+                elif identifier.startswith(('http://', 'https://')):
+                    entry_type = 'domain'
+                elif '\\' in identifier or '/' in identifier:
+                    entry_type = 'path'
+                else:
+                    entry_type = 'name'
+        
+        if identifier:
+            reply = QMessageBox.question(
+                self, "Remove from Whitelist",
+                f"Remove the following from whitelist?\n\nType: {entry_type}\nIdentifier: {identifier[:100]}{'...' if len(identifier) > 100 else ''}",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                whitelist.remove_entry(identifier)
+                self.log(f"Removed from whitelist: {entry_type}={identifier[:50]}")
+                QMessageBox.information(self, "Success", "Entry removed from whitelist.")
+                self.refresh_whitelist()
+                
+                # Notify any open dialogs to update their buttons
+                self._notify_whitelist_change(detection, False)
+        else:
+            QMessageBox.warning(self, "Cannot Remove", 
+                f"No identifier found to remove from whitelist.\n\n"
+                f"Detection type: {detection.detection_type}")
+    
+    def _notify_whitelist_change(self, detection: Detection, is_whitelisted: bool):
+        """Notify open dialogs about whitelist change.
+        
+        Args:
+            detection: The detection that was changed
+            is_whitelisted: True if now whitelisted, False if removed
+        """
+        # Find any open DetectionDialogs and update them
+        for widget in QApplication.topLevelWidgets():
+            if isinstance(widget, DetectionDialog):
+                if widget.detection.detection_id == detection.detection_id:
+                    widget.update_whitelist_button(is_whitelisted)
     
     def _open_file_location(self, detection: Detection):
         """Open file location in explorer."""

@@ -78,6 +78,18 @@ class SecureStorage:
         """
         return self.store_key(key_name, api_key)
     
+    def get_api_key(self, key_name: str) -> Optional[str]:
+        """
+        Retrieve an API key from secure storage (alias for retrieve_key).
+        
+        Args:
+            key_name: Name/identifier for the key
+        
+        Returns:
+            The API key if found, None otherwise
+        """
+        return self.retrieve_key(key_name)
+    
     def store_key(self, key_name: str, api_key: str) -> bool:
         """
         Store an API key securely.
