@@ -573,4 +573,4 @@ type data\logs\cyberguardian.log | findstr /i "error"
 
 ---
 
-*CyberGuardian v1.1.0 - For questions or issues, visit: https://github.com/YOUR_USERNAME/CyberGuardian*
+*CyberGuardian v1.1.0 - For questions or issues, visit: [https://github.com/Souhaieb-Marzouk/CyberGuardian](https://github.com/Souhaieb-Marzouk/CyberGuardian)*
