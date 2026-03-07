@@ -342,7 +342,7 @@ This project is licensed under the MIT License - see the [LICENSE](https://githu
 ## 📞 Contact
 
 - **GitHub**: [Souhaieb-Marzouk/CyberGuardian](https://github.com/Souhaieb-Marzouk/CyberGuardian)
-- **LinkedIn**: [Your LinkedIn Profile]
+- **LinkedIn**: [Souhaieb Marzouk](https://www.linkedin.com/in/souhaiebmarzouk/)
 - **Issues**: [GitHub Issues](https://github.com/Souhaieb-Marzouk/CyberGuardian/issues)
 
 ---
