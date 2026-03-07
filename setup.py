@@ -17,13 +17,13 @@ requirements = [r.strip() for r in requirements if r.strip() and not r.startswit
 
 setup(
     name='cyberguardian',
-    version='1.0.0',
-    author='CyberGuardian Team',
-    author_email='cyberguardian@example.com',
+    version='1.1.0',
+    author='Souhaieb Marzouk Team',
+    author_email='marzouk.souhaieb@proton.me',
     description='Advanced Malware & Anomaly Detection Tool for Windows',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/YOUR_USERNAME/cyberguardian',
+    url='https://github.com/Souhaieb-Marzouk/CyberGuardian',
     license='MIT',
     
     # Package discovery

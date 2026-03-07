@@ -416,9 +416,9 @@ Perform a thorough analysis considering:
    - Urgency level for remediation
 
 6. REMEDIATION GUIDANCE
-   - Specific steps to neutralize the threat
-   - Containment recommendations
-   - Verification steps to confirm removal
+   - Specific steps to neutralize the threat (address it to beginners)
+   - Containment recommendations (address it to beginners)
+   - Verification steps to confirm removal (address it to beginners)
 
 Provide your analysis in the following JSON format:
 {{
