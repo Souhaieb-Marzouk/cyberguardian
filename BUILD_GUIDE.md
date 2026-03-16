@@ -440,4 +440,8 @@ For issues or questions:
 
 ---
 
+<<<<<<< HEAD
 *Last updated: 2026*
+=======
+*For issues, check the troubleshooting section above or visit: [https://github.com/Souhaieb-Marzouk/CyberGuardian/issues](https://github.com/Souhaieb-Marzouk/CyberGuardian/issues)*
+>>>>>>> 3966fb43c2fba7d03f8de813ad8fc9c57ca1b62a

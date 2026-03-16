@@ -662,6 +662,7 @@ python main.py --update-rules
 
 ---
 
+<<<<<<< HEAD
 ## Keyboard Shortcuts (GUI)
 
 | Shortcut | Action |
@@ -722,3 +723,6 @@ For issues, feature requests, or contributions:
    - Error message
    - Steps to reproduce
    - System information (Windows version, Python version)
+=======
+*CyberGuardian v1.1.0 - For questions or issues, visit: [https://github.com/Souhaieb-Marzouk/CyberGuardian](https://github.com/Souhaieb-Marzouk/CyberGuardian)*
+>>>>>>> 3966fb43c2fba7d03f8de813ad8fc9c57ca1b62a
